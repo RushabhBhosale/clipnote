@@ -1,8 +1,15 @@
-import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager'
+import { Image } from '@tauri-apps/api/image'
+import { readImage, readText, writeImage, writeText } from '@tauri-apps/plugin-clipboard-manager'
+import { fingerprintClipboardImage, type ClipboardImageInfo } from './imageService'
+
+export interface ClipboardImagePayload extends ClipboardImageInfo {
+  image: Image
+}
 
 export interface ClipboardProvider {
-  start(onText: (text: string) => void): () => void
+  start(onText: (text: string) => void, onImage?: (payload: ClipboardImagePayload) => Promise<void>): () => void
   write(text: string): Promise<void>
+  writeImagePath(path: string): Promise<void>
 }
 
 function isTauri() {
@@ -10,6 +17,7 @@ function isTauri() {
 }
 
 let locallyWrittenText: string | undefined
+let locallyWrittenImageFingerprint: string | undefined
 
 async function readClipboardText() {
   if (isTauri()) return readText()
@@ -38,11 +46,33 @@ export async function copyCredentialSecret(text: string) {
 }
 
 export const systemClipboardProvider: ClipboardProvider = {
-  start(onText) {
+  start(onText, onImage) {
     let previous = ''
+    let previousImage = ''
     let active = true
     const poll = async () => {
       if (!active) return
+      if (isTauri() && onImage) {
+        let clipboardImage: Image | undefined
+        try {
+          clipboardImage = await readImage()
+          const info = await fingerprintClipboardImage(clipboardImage)
+          if (info.fingerprint === locallyWrittenImageFingerprint) {
+            previousImage = info.fingerprint
+            locallyWrittenImageFingerprint = undefined
+            return
+          }
+          if (info.fingerprint !== previousImage) {
+            previousImage = info.fingerprint
+            await onImage({ image: clipboardImage, ...info })
+          }
+          return
+        } catch {
+          // The current clipboard item is not an image; continue with text.
+        } finally {
+          await clipboardImage?.close().catch(() => undefined)
+        }
+      }
       try {
         const current = await readClipboardText()
         if (current && current === locallyWrittenText) {
@@ -67,5 +97,15 @@ export const systemClipboardProvider: ClipboardProvider = {
   },
   async write(text) {
     await writeClipboardText(text)
+  },
+  async writeImagePath(path) {
+    const image = await Image.fromPath(path)
+    try {
+      const info = await fingerprintClipboardImage(image)
+      locallyWrittenImageFingerprint = info.fingerprint
+      await writeImage(image)
+    } finally {
+      await image.close().catch(() => undefined)
+    }
   },
 }

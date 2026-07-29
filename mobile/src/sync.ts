@@ -76,7 +76,7 @@ export async function push(clips: Clip[]) {
   if (!supabase) return
   const current = await user()
   if (!current || !clips.length) return
-  const eligible = clips.filter((clip) => !clip.isSensitive && !clip.expiresAt && !clip.deletedAt)
+  const eligible = clips.filter((clip) => !clip.isSensitive && clip.contentType !== 'image' && !clip.expiresAt && !clip.deletedAt)
   if (!eligible.length) return
   if (eligible.some((clip) => !uuidPattern.test(clip.id))) throw new Error('A local note could not be prepared for sync.')
   const syncable = eligible

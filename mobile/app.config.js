@@ -16,11 +16,19 @@ module.exports = {
   expo: {
     name: 'ClipNote',
     slug: 'clipnote',
-    version: '0.1.0',
+    version: '0.1.1',
     orientation: 'portrait',
     userInterfaceStyle: 'automatic',
-    ios: { bundleIdentifier: 'com.clipnote.mobile', supportsTablet: true },
-    android: { package: 'com.clipnote.mobile' },
+    icon: './assets/icon.png',
+    splash: { image: './assets/splash-icon.png', resizeMode: 'contain', backgroundColor: '#ffffff' },
+    ios: { bundleIdentifier: 'com.clipnote.mobile', supportsTablet: true, icon: './assets/icon.png' },
+    android: {
+      package: 'com.clipnote.mobile',
+      versionCode: 2,
+      icon: './assets/icon.png',
+      adaptiveIcon: { foregroundImage: './assets/adaptive-icon.png', backgroundColor: '#ffffff' },
+    },
+    web: { favicon: './assets/favicon.png' },
     extra: {
       supabaseUrl: environment.NEXT_PUBLIC_SUPABASE_URL ?? environment.SUPABASE_URL,
       supabasePublishableKey: environment.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ?? environment.SUPABASE_PUBLISHABLE_KEY,

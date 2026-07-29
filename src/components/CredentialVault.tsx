@@ -2,6 +2,7 @@ import { ArrowLeft, Copy, Eye, EyeOff, KeyRound, LoaderCircle, Plus, Save, Stick
 import { type FormEvent, useCallback, useEffect, useState } from 'react'
 import { copyCredentialSecret, systemClipboardProvider } from '../services/clipboardProvider'
 import { deleteCredential, getCredential, listCredentials, saveCredential, type Credential, type CredentialSummary } from '../services/credentialService'
+import { dismissAfterCopy } from '../services/nativeService'
 
 function emptyCredential(): Credential {
   return {
@@ -27,7 +28,6 @@ export function CredentialVault({ onClose }: { onClose: () => void }) {
   const [credentials, setCredentials] = useState<CredentialSummary[]>([])
   const [draft, setDraft] = useState<Credential>()
   const [revealPassword, setRevealPassword] = useState(false)
-  const [pendingDeleteId, setPendingDeleteId] = useState<string>()
   const [busy, setBusy] = useState(true)
   const [notice, setNotice] = useState<string>()
 
@@ -50,7 +50,6 @@ export function CredentialVault({ onClose }: { onClose: () => void }) {
     try {
       setDraft(await getCredential(id))
       setRevealPassword(false)
-      setPendingDeleteId(undefined)
       setNotice(undefined)
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
@@ -88,6 +87,7 @@ export function CredentialVault({ onClose }: { onClose: () => void }) {
       }
       if (field === 'password') await copyCredentialSecret(value)
       else await systemClipboardProvider.write(value)
+      await dismissAfterCopy()
       setNotice(field === 'password' ? 'Password copied for 60 seconds. Not added to history.' : 'Username copied. Not added to history.')
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
@@ -95,15 +95,9 @@ export function CredentialVault({ onClose }: { onClose: () => void }) {
   }
 
   const remove = async (id: string) => {
-    if (pendingDeleteId !== id) {
-      setPendingDeleteId(id)
-      setNotice('Click Delete again to remove it permanently.')
-      return
-    }
     setBusy(true)
     try {
       await deleteCredential(id)
-      setPendingDeleteId(undefined)
       await refresh()
       setNotice('Credential deleted.')
     } catch (error) {
@@ -139,7 +133,7 @@ export function CredentialVault({ onClose }: { onClose: () => void }) {
         <div className="credential-row-actions">
           {credential.username ? <button onClick={() => void copyValue(credential.id, 'username')} title="Copy username"><UserRound size={14} /></button> : null}
           <button onClick={() => void copyValue(credential.id, 'password')} title="Copy password"><Copy size={14} /></button>
-          <button className={pendingDeleteId === credential.id ? 'is-confirming' : ''} onClick={() => void remove(credential.id)} title={pendingDeleteId === credential.id ? 'Delete permanently' : 'Delete'}>{pendingDeleteId === credential.id ? 'Delete?' : <Trash2 size={14} />}</button>
+          <button className="credential-delete" onClick={() => void remove(credential.id)} title="Delete credential" aria-label={`Delete ${credential.label}`}><Trash2 size={14} /></button>
         </div>
       </article>) : null}
     </div>}

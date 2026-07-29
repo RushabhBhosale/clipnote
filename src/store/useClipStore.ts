@@ -3,8 +3,10 @@ import { classifyContent, suggestedTitle } from '../features/clipboard/classifie
 import { moveToTrash as markTrashed, restoreFromTrash as untrash, updateRepeatedCopy } from '../features/clipboard/history'
 import { detectSensitiveContent, hasExpired } from '../features/sensitive-content/detector'
 import { makeId, toIsoDate } from '../lib/utils'
-import { systemClipboardProvider } from '../services/clipboardProvider'
+import { systemClipboardProvider, type ClipboardImagePayload } from '../services/clipboardProvider'
+import { dismissAfterCopy } from '../services/nativeService'
 import { clipRepository } from '../services/clipRepository'
+import { saveClipboardImage } from '../services/imageService'
 import { loadSettings, saveSettings } from '../services/settingsRepository'
 import { defaultSettings, type Clip, type ClipSettings } from '../types/clip'
 
@@ -20,6 +22,7 @@ interface ClipState {
   initialize: () => Promise<void>
   setMonitoring: (enabled: boolean) => void
   ingestText: (text: string, sourceApplication?: string) => Promise<void>
+  ingestImage: (payload: ClipboardImagePayload, sourceApplication?: string) => Promise<void>
   addNote: (text: string) => Promise<string | undefined>
   saveStickyNote: (text: string, id?: string) => Promise<string | undefined>
   consolidateDailyNotes: () => Promise<void>
@@ -134,7 +137,10 @@ export const useClipStore = create<ClipState>((set, get) => ({
     stopMonitoring?.()
     stopMonitoring = undefined
     if (enabled) {
-      stopMonitoring = systemClipboardProvider.start((text) => void get().ingestText(text))
+      stopMonitoring = systemClipboardProvider.start(
+        (text) => void get().ingestText(text),
+        (payload) => get().ingestImage(payload),
+      )
     }
     set({ isMonitoring: enabled })
   },
@@ -151,6 +157,40 @@ export const useClipStore = create<ClipState>((set, get) => ({
       return
     }
     const clip = createClip(text, settings, sourceApplication)
+    await persist(clip)
+    const next = [clip, ...clips]
+    const overflowIds = await trimHistory(next, settings)
+    set({ clips: orderClips(next.map((entry) => overflowIds.includes(entry.id) ? { ...entry, deletedAt: now } : entry)) })
+  },
+  async ingestImage(payload, sourceApplication) {
+    const { settings, clips } = get()
+    if (!settings.saveImages || !get().isMonitoring) return
+    const now = toIsoDate()
+    const existing = clips.find((entry) => !entry.deletedAt && !entry.isSnippet && entry.contentType === 'image' && entry.normalizedContent === payload.fingerprint)
+    if (existing) {
+      const updated = updateRepeatedCopy(existing, now)
+      await persist(updated)
+      set({ clips: orderClips([updated, ...clips.filter((entry) => entry.id !== existing.id)]) })
+      return
+    }
+    const id = makeId()
+    const imagePath = await saveClipboardImage(id, payload.image)
+    const clip: Clip = {
+      id,
+      title: `Image · ${payload.width}×${payload.height}`,
+      rawContent: 'Copied image',
+      normalizedContent: payload.fingerprint,
+      contentType: 'image',
+      sourceApplication,
+      createdAt: now,
+      updatedAt: now,
+      lastCopiedAt: now,
+      copyCount: 1,
+      isFavorite: false,
+      isSensitive: false,
+      tags: [],
+      imagePath,
+    }
     await persist(clip)
     const next = [clip, ...clips]
     const overflowIds = await trimHistory(next, settings)
@@ -234,10 +274,12 @@ export const useClipStore = create<ClipState>((set, get) => ({
     const current = get().clips.find((clip) => clip.id === id)
     if (!current) return
     try {
-      await systemClipboardProvider.write(current.rawContent)
+      if (current.contentType === 'image' && current.imagePath) await systemClipboardProvider.writeImagePath(current.imagePath)
+      else await systemClipboardProvider.write(current.rawContent)
       const updated = { ...current, lastCopiedAt: toIsoDate(), updatedAt: toIsoDate(), copyCount: current.copyCount + 1 }
       await persist(updated)
       set({ clips: orderClips([updated, ...get().clips.filter((clip) => clip.id !== id)]), toast: 'Copied' })
+      await dismissAfterCopy()
     } catch {
       set({ toast: 'Could not write to the clipboard' })
     }
@@ -319,7 +361,7 @@ export const useClipStore = create<ClipState>((set, get) => ({
     const byId = new Map(current.map((clip) => [clip.id, clip]))
     let changed = false
     for (const incoming of entries) {
-      if (incoming.isSensitive || hasExpired(incoming)) continue
+      if (incoming.isSensitive || incoming.contentType === 'image' || hasExpired(incoming)) continue
       const local = byId.get(incoming.id)
       if (local && new Date(local.updatedAt).getTime() >= new Date(incoming.updatedAt).getTime()) continue
       await persist(incoming)

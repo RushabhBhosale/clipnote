@@ -13,3 +13,18 @@ export async function setStickyWindow(enabled: boolean) {
   if (!isTauri()) return
   await invoke('set_sticky_mode', { enabled })
 }
+
+export async function dismissAfterCopy() {
+  if (!isTauri()) return
+  await invoke('dismiss_after_copy')
+}
+
+export async function hideClipNote() {
+  if (!isTauri()) return
+  await invoke('hide_clipnote')
+}
+
+export async function showClipNote() {
+  if (!isTauri()) return
+  await invoke('show_clipnote')
+}

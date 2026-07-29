@@ -2,9 +2,10 @@ use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf, process::Command};
 use tauri::{
+    image::JsImage,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, LogicalSize, Manager, RunEvent, Size, WebviewWindow, WindowEvent,
+    AppHandle, Emitter, LogicalSize, Manager, RunEvent, Size, Webview, WebviewWindow, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
@@ -53,6 +54,14 @@ struct CredentialSummary {
     updated_at: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardImageInfo {
+    fingerprint: String,
+    width: u32,
+    height: u32,
+}
+
 impl From<&Credential> for CredentialSummary {
     fn from(credential: &Credential) -> Self {
         Self {
@@ -86,12 +95,15 @@ fn validate_credential(credential: &Credential) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn read_credential_vault() -> Result<Vec<Credential>, String> {
-    use security_framework::passwords::get_generic_password;
+    use security_framework::os::macos::passwords::find_generic_password;
 
-    match get_generic_password(CREDENTIAL_KEYCHAIN_SERVICE, CREDENTIAL_KEYCHAIN_ACCOUNT) {
-        Ok(data) => serde_json::from_slice(&data).map_err(|_| "Unable to read credentials from macOS Keychain".to_string()),
+    match find_generic_password(None, CREDENTIAL_KEYCHAIN_SERVICE, CREDENTIAL_KEYCHAIN_ACCOUNT) {
+        Ok((data, _)) => serde_json::from_slice(data.as_ref()).map_err(|_| "Unable to read credentials from macOS Keychain".to_string()),
         Err(error) if error.code() == -25_300 => Ok(Vec::new()),
-        Err(_) => Err("Unable to access credentials in macOS Keychain".to_string()),
+        Err(error) => {
+            eprintln!("ClipNote Keychain read failed with OSStatus {}", error.code());
+            Err("Unable to access credentials in macOS Keychain".to_string())
+        }
     }
 }
 
@@ -102,14 +114,18 @@ fn read_credential_vault() -> Result<Vec<Credential>, String> {
 
 #[cfg(target_os = "macos")]
 fn write_credential_vault(credentials: &[Credential]) -> Result<(), String> {
-    use security_framework::passwords::set_generic_password;
+    use security_framework::os::macos::keychain::SecKeychain;
 
     let data = serde_json::to_vec(credentials).map_err(|_| "Unable to prepare credentials for macOS Keychain".to_string())?;
     if data.len() > 1_000_000 {
         return Err("Credential vault is too large".into());
     }
-    set_generic_password(CREDENTIAL_KEYCHAIN_SERVICE, CREDENTIAL_KEYCHAIN_ACCOUNT, &data)
-        .map_err(|_| "Unable to save credentials in macOS Keychain".to_string())
+    SecKeychain::default()
+        .and_then(|keychain| keychain.set_generic_password(CREDENTIAL_KEYCHAIN_SERVICE, CREDENTIAL_KEYCHAIN_ACCOUNT, &data))
+        .map_err(|error| {
+            eprintln!("ClipNote Keychain write failed with OSStatus {}", error.code());
+            "Unable to save credentials in macOS Keychain".to_string()
+        })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -148,6 +164,40 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let data_dir = app.path().app_data_dir().map_err(|_| "Unable to access local app data".to_string())?;
     fs::create_dir_all(&data_dir).map_err(|_| "Unable to prepare local app data".to_string())?;
     Ok(data_dir)
+}
+
+fn image_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = app_data_dir(app)?.join("images");
+    fs::create_dir_all(&directory).map_err(|_| "Unable to prepare local image storage".to_string())?;
+    Ok(directory)
+}
+
+fn image_fingerprint(image: &tauri::image::Image<'_>) -> ClipboardImageInfo {
+    let rgba = image.rgba();
+    let stride = (rgba.len() / 4_096).max(1);
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in rgba.iter().step_by(stride) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    if let Some(last) = rgba.last() {
+        hash ^= u64::from(*last);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    ClipboardImageInfo {
+        fingerprint: format!("{}x{}-{hash:016x}", image.width(), image.height()),
+        width: image.width(),
+        height: image.height(),
+    }
+}
+
+fn remove_clip_image(app: &AppHandle, image_path: Option<String>) {
+    let Some(image_path) = image_path else { return };
+    let path = PathBuf::from(image_path);
+    let Ok(directory) = image_data_dir(app) else { return };
+    if path.parent() == Some(directory.as_path()) && path.extension().and_then(|value| value.to_str()) == Some("png") {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn open_database(app: &AppHandle) -> Result<Connection, String> {
@@ -247,7 +297,9 @@ fn clips_upsert(app: AppHandle, clip: Clip) -> Result<Clip, String> {
 fn clips_remove_permanently(app: AppHandle, id: String) -> Result<(), String> {
     if id.is_empty() || id.len() > 128 { return Err("Invalid clipboard entry".into()); }
     let connection = open_database(&app)?;
+    let image_path = connection.query_row("SELECT image_path FROM clips WHERE id = ?1", params![id.clone()], |row| row.get::<_, Option<String>>(0)).ok().flatten();
     connection.execute("DELETE FROM clips WHERE id = ?1", params![id]).map_err(|_| "Unable to remove clipboard entry".to_string())?;
+    remove_clip_image(&app, image_path);
     Ok(())
 }
 
@@ -255,7 +307,45 @@ fn clips_remove_permanently(app: AppHandle, id: String) -> Result<(), String> {
 fn clips_clear(app: AppHandle) -> Result<(), String> {
     let connection = open_database(&app)?;
     connection.execute("DELETE FROM clips", []).map_err(|_| "Unable to clear clipboard history".to_string())?;
+    if let Ok(directory) = image_data_dir(&app) {
+        let _ = fs::remove_dir_all(&directory);
+        let _ = fs::create_dir_all(directory);
+    }
     Ok(())
+}
+
+#[tauri::command]
+fn clipboard_image_fingerprint(webview: Webview, image: JsImage) -> Result<ClipboardImageInfo, String> {
+    let resources = webview.resources_table();
+    let image = image.into_img(&resources).map_err(|_| "Unable to inspect the clipboard image".to_string())?;
+    let expected_len = u64::from(image.width()) * u64::from(image.height()) * 4;
+    if image.width() == 0 || image.height() == 0 || expected_len != image.rgba().len() as u64 || expected_len > 100_000_000 {
+        return Err("Clipboard image is empty or too large".into());
+    }
+    Ok(image_fingerprint(&image))
+}
+
+#[tauri::command]
+fn clipboard_image_save(app: AppHandle, webview: Webview, id: String, image: JsImage) -> Result<String, String> {
+    if id.is_empty() || id.len() > 128 || !id.chars().all(|character| character.is_ascii_alphanumeric() || character == '-') {
+        return Err("Invalid clipboard image id".into());
+    }
+    let resources = webview.resources_table();
+    let image = image.into_img(&resources).map_err(|_| "Unable to read the clipboard image".to_string())?;
+    let expected_len = u64::from(image.width()) * u64::from(image.height()) * 4;
+    if image.width() == 0 || image.height() == 0 || expected_len != image.rgba().len() as u64 || expected_len > 100_000_000 {
+        return Err("Clipboard image is empty or too large".into());
+    }
+    let path = image_data_dir(&app)?.join(format!("{id}.png"));
+    image::save_buffer_with_format(
+        &path,
+        image.rgba(),
+        image.width(),
+        image.height(),
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    ).map_err(|_| "Unable to save the clipboard image".to_string())?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -330,7 +420,30 @@ fn set_sticky_mode(window: WebviewWindow, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn dismiss_after_copy(app: AppHandle) -> Result<(), String> {
+    hide_clipnote(app)
+}
+
+#[tauri::command]
+fn hide_clipnote(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.hide().map_err(|_| "Unable to hide ClipNote".to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    app.hide().map_err(|_| "Unable to hide ClipNote".to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn show_clipnote(app: AppHandle) -> Result<(), String> {
+    show_main_window(&app);
+    Ok(())
+}
+
 fn show_main_window(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
@@ -341,7 +454,6 @@ fn register_global_shortcuts(app: &AppHandle) {
     let shortcuts = app.global_shortcut();
     if let Err(error) = shortcuts.on_shortcut("CommandOrControl+Shift+Space", |app, _, event| {
         if event.state == ShortcutState::Pressed {
-            show_main_window(app);
             let _ = app.emit("clipnote://open-sticky", ());
         }
     }) {
@@ -349,7 +461,6 @@ fn register_global_shortcuts(app: &AppHandle) {
     }
     if let Err(error) = shortcuts.on_shortcut("CommandOrControl+Shift+V", |app, _, event| {
         if event.state == ShortcutState::Pressed {
-            show_main_window(app);
             let _ = app.emit("clipnote://open-clipboard", ());
         }
     }) {
@@ -357,7 +468,6 @@ fn register_global_shortcuts(app: &AppHandle) {
     }
     if let Err(error) = shortcuts.on_shortcut("CommandOrControl+Shift+Comma", |app, _, event| {
         if event.state == ShortcutState::Pressed {
-            show_main_window(app);
             let _ = app.emit("clipnote://open-credentials", ());
         }
     }) {
@@ -372,7 +482,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &pause, &clear, &settings, &quit])?;
-    TrayIconBuilder::with_id("clipnote-tray")
+    let mut tray = TrayIconBuilder::with_id("clipnote-tray");
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray
         .tooltip("ClipNote")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -402,12 +516,17 @@ pub fn run() {
             clips_upsert,
             clips_remove_permanently,
             clips_clear,
+            clipboard_image_fingerprint,
+            clipboard_image_save,
             credentials_list,
             credential_get,
             credential_save,
             credential_delete,
             open_data_folder,
-            set_sticky_mode
+            set_sticky_mode,
+            dismiss_after_copy,
+            hide_clipnote,
+            show_clipnote
         ])
         .build(tauri::generate_context!())
         .expect("error while building ClipNote");

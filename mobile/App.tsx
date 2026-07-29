@@ -1,7 +1,8 @@
 import * as Clipboard from 'expo-clipboard'
 import { StatusBar } from 'expo-status-bar'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Alert, AppState, Pressable, SafeAreaView, SectionList, StyleSheet, Text, TextInput, View } from 'react-native'
+import { Alert, AppState, Image, Pressable, SectionList, StyleSheet, Text, TextInput, View } from 'react-native'
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context'
 import type { User } from '@supabase/supabase-js'
 import { loadClips, saveClips } from './src/storage'
 import { isConfigured, listen, pull, push, sessionUser, signIn, signOut, signUp } from './src/sync'
@@ -110,10 +111,10 @@ function AuthScreen({ onDone }: { onDone: () => void }) {
       setMessage(error instanceof Error ? error.message : 'Could not connect your account.')
     } finally { setBusy(false) }
   }
-  return <SafeAreaView style={styles.authPage}>
+  return <SafeAreaView style={styles.authPage} edges={['top', 'bottom', 'left', 'right']}>
     <StatusBar style="dark" />
     <View style={styles.authCard}>
-      <View style={styles.mark}><Text style={styles.markText}>⌘</Text></View>
+      <Image source={require('./assets/icon.png')} style={styles.mark} accessibilityLabel="ClipNote" />
       <Text style={styles.authTitle}>ClipNote</Text>
       <Text style={styles.authText}>Sign in with the same account you use on your laptop. Your notes will stay in sync automatically.</Text>
       <TextInput style={styles.input} autoCapitalize="none" autoComplete="email" keyboardType="email-address" value={email} onChangeText={setEmail} placeholder="Email" placeholderTextColor="#9c9ca1" />
@@ -126,7 +127,7 @@ function AuthScreen({ onDone }: { onDone: () => void }) {
   </SafeAreaView>
 }
 
-export default function App() {
+function ClipNoteApp() {
   const [user, setUser] = useState<User>()
   const [clips, setClips] = useState<Clip[]>([])
   const [localReady, setLocalReady] = useState(false)
@@ -150,7 +151,7 @@ export default function App() {
   const mergeRemote = useCallback((incoming: Clip[]) => {
     const byId = new Map(clipsRef.current.map((clip) => [clip.id, clip]))
     for (const remote of incoming) {
-      if (remote.isSensitive || remote.expiresAt) continue
+      if (remote.isSensitive || remote.contentType === 'image' || remote.expiresAt) continue
       const local = byId.get(remote.id)
       if (!local || Date.parse(remote.updatedAt) > Date.parse(local.updatedAt)) byId.set(remote.id, remote)
     }
@@ -319,10 +320,10 @@ export default function App() {
     setDraftDirty(true)
   }
 
-  if (!isConfigured()) return <SafeAreaView style={styles.authPage}><Text style={styles.authTitle}>ClipNote needs sync configuration.</Text></SafeAreaView>
+  if (!isConfigured()) return <SafeAreaView style={styles.authPage} edges={['top', 'bottom', 'left', 'right']}><Text style={styles.authTitle}>ClipNote needs sync configuration.</Text></SafeAreaView>
   if (!user) return <AuthScreen onDone={() => void sessionUser().then(setUser)} />
 
-  return <SafeAreaView style={styles.page}>
+  return <SafeAreaView style={styles.page} edges={['top', 'bottom', 'left', 'right']}>
     <StatusBar style="dark" />
     <View style={styles.topbar}>
       <View><Text style={styles.title}>ClipNote</Text><Text style={styles.subtitle}>{cloudReady ? 'Synced with your laptop' : 'Saving locally…'}</Text></View>
@@ -341,10 +342,14 @@ export default function App() {
   </SafeAreaView>
 }
 
+export default function App() {
+  return <SafeAreaProvider><ClipNoteApp /></SafeAreaProvider>
+}
+
 const styles = StyleSheet.create({
   page: { flex: 1, backgroundColor: '#f8f7f4' }, authPage: { flex: 1, justifyContent: 'center', backgroundColor: '#f8f7f4', padding: 24 },
   authCard: { width: '100%', maxWidth: 420, alignSelf: 'center', borderWidth: 1, borderColor: border, borderRadius: 18, backgroundColor: paper, padding: 25 },
-  mark: { width: 42, height: 42, justifyContent: 'center', alignItems: 'center', borderRadius: 12, backgroundColor: '#eaf1fb' }, markText: { color: accent, fontSize: 20, fontWeight: '700' },
+  mark: { width: 42, height: 42, borderRadius: 12 },
   authTitle: { color: ink, fontSize: 28, fontWeight: '700', letterSpacing: -0.7, marginTop: 17 }, authText: { color: muted, fontSize: 14, lineHeight: 20, marginTop: 8, marginBottom: 20 },
   input: { borderWidth: 1, borderColor: border, borderRadius: 9, color: ink, fontSize: 15, paddingHorizontal: 12, paddingVertical: 11, marginBottom: 10, backgroundColor: '#fff' },
   formMessage: { color: '#8f6727', fontSize: 12, lineHeight: 17, marginVertical: 6 }, primaryButton: { alignItems: 'center', borderRadius: 9, backgroundColor: accent, paddingVertical: 12, marginTop: 8 }, primaryButtonText: { color: '#fff', fontSize: 15, fontWeight: '700' },
