@@ -17,6 +17,26 @@ async function readClipboardText() {
   return ''
 }
 
+async function writeClipboardText(text: string) {
+  locallyWrittenText = text
+  if (isTauri()) {
+    await writeText(text)
+    return
+  }
+  if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text)
+}
+
+export async function copyCredentialSecret(text: string) {
+  await writeClipboardText(text)
+  window.setTimeout(async () => {
+    try {
+      if (await readClipboardText() === text) await writeClipboardText('')
+    } catch {
+      // If clipboard access changes, leave the user's current clipboard untouched.
+    }
+  }, 60_000)
+}
+
 export const systemClipboardProvider: ClipboardProvider = {
   start(onText) {
     let previous = ''
@@ -46,11 +66,6 @@ export const systemClipboardProvider: ClipboardProvider = {
     }
   },
   async write(text) {
-    locallyWrittenText = text
-    if (isTauri()) {
-      await writeText(text)
-      return
-    }
-    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text)
+    await writeClipboardText(text)
   },
 }

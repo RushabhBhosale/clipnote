@@ -1,9 +1,9 @@
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { register, unregister } from '@tauri-apps/plugin-global-shortcut'
-import { Clipboard, Cloud, Copy, History, LoaderCircle, LogOut, Pause, Plus, ShieldAlert, Smartphone, StickyNote, Trash2, X } from 'lucide-react'
+import { Clipboard, Cloud, Copy, History, KeyRound, LoaderCircle, LogOut, Pause, ShieldAlert, Smartphone, StickyNote, Trash2, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { User } from '@supabase/supabase-js'
+import { CredentialVault } from './components/CredentialVault'
 import { maskSensitiveContent } from './features/sensitive-content/detector'
 import { formatRelativeTime } from './lib/utils'
 import { isCloudSyncConfigured, pullCloudClips, pushCloudClips, signInWithPassword, signOutOfCloudSync, signUpWithPassword, subscribeToCloudSync } from './services/syncService'
@@ -31,6 +31,14 @@ function formatTime(value: string) {
 function displayContent(clip: Clip) {
   if (!clip.isSensitive) return clip.rawContent
   return clip.contentType === 'otp' ? `One-time code · ${maskSensitiveContent(clip.rawContent)}` : `Sensitive clipboard item · ${maskSensitiveContent(clip.rawContent)}`
+}
+
+function isWrittenNote(clip: Clip) {
+  return clip.sourceApplication === 'Note' || clip.sourceApplication === 'Mobile note' || clip.sourceApplication === 'Daily note'
+}
+
+function isToday(value: string) {
+  return new Date(value).toDateString() === new Date().toDateString()
 }
 
 function SyncPanel({ user, onClose }: { user?: User, onClose: () => void }) {
@@ -84,8 +92,8 @@ export default function App() {
   const toast = useClipStore((state) => state.toast)
   const initialize = useClipStore((state) => state.initialize)
   const setMonitoring = useClipStore((state) => state.setMonitoring)
-  const addNote = useClipStore((state) => state.addNote)
   const saveStickyNote = useClipStore((state) => state.saveStickyNote)
+  const consolidateDailyNotes = useClipStore((state) => state.consolidateDailyNotes)
   const copyClip = useClipStore((state) => state.copyClip)
   const moveToTrash = useClipStore((state) => state.moveToTrash)
   const mergeRemoteClips = useClipStore((state) => state.mergeRemoteClips)
@@ -93,31 +101,104 @@ export default function App() {
   const [note, setNote] = useState('')
   const [openClipId, setOpenClipId] = useState<string>()
   const [stickyMode, setStickyMode] = useState(false)
+  const [clipboardView, setClipboardView] = useState(false)
+  const [credentialsView, setCredentialsView] = useState(false)
   const [showStickyHistory, setShowStickyHistory] = useState(false)
   const [cloudUser, setCloudUser] = useState<User>()
   const [cloudReady, setCloudReady] = useState(false)
   const [showSyncPanel, setShowSyncPanel] = useState(false)
-  const stickyNoteId = useRef<string | undefined>(undefined)
+  const [noteDirty, setNoteDirty] = useState(false)
+  const todayNoteId = useRef<string | undefined>(undefined)
+  const editVersion = useRef(0)
   const uploadedRevisions = useRef(new Map<string, string>())
+  const dailyDuplicates = useMemo(() => {
+    const counts = new Map<string, number>()
+    clips.filter((clip) => !clip.deletedAt && !clip.isSnippet && isWrittenNote(clip)).forEach((clip) => {
+      const day = new Date(clip.createdAt).toDateString()
+      counts.set(day, (counts.get(day) ?? 0) + 1)
+    })
+    return [...counts.values()].some((count) => count > 1)
+  }, [clips])
+  const todayNote = useMemo(() => clips
+    .filter((clip) => !clip.deletedAt && !clip.isSnippet && isWrittenNote(clip) && isToday(clip.createdAt))
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())[0], [clips])
   const timeline = useMemo(() => {
     const groups = new Map<string, Clip[]>()
-    clips.filter((clip) => !clip.deletedAt && !clip.isSnippet).forEach((clip) => {
-      const day = formatDay(clip.lastCopiedAt)
+    clips.filter((clip) => {
+      if (clip.deletedAt || clip.isSnippet) return false
+      if (clipboardView) return !isWrittenNote(clip)
+      return isWrittenNote(clip) && clip.id !== todayNote?.id
+    }).forEach((clip) => {
+      const day = formatDay(clip.createdAt)
       groups.set(day, [...(groups.get(day) ?? []), clip])
     })
     return [...groups.entries()]
-  }, [clips])
+  }, [clipboardView, clips, todayNote?.id])
   const openClip = useMemo(() => clips.find((clip) => clip.id === openClipId && !clip.deletedAt), [clips, openClipId])
   const toggleStickyMode = useCallback(async () => {
     const next = !stickyMode
     await setStickyWindow(next)
     setStickyMode(next)
+    if (next) setClipboardView(false)
+    if (next) setCredentialsView(false)
     setShowStickyHistory(false)
-    setNote('')
-    stickyNoteId.current = undefined
   }, [stickyMode])
+  const openStickyNote = useCallback(async () => {
+    await setStickyWindow(true)
+    setStickyMode(true)
+    setClipboardView(false)
+    setCredentialsView(false)
+    setShowStickyHistory(false)
+    if (isTauri()) {
+      const currentWindow = getCurrentWindow()
+      await currentWindow.show()
+      await currentWindow.setFocus()
+    }
+  }, [])
+  const openClipboardHistory = useCallback(async () => {
+    await setStickyWindow(true)
+    setStickyMode(false)
+    setShowStickyHistory(false)
+    setClipboardView(true)
+    setCredentialsView(false)
+    if (isTauri()) {
+      const currentWindow = getCurrentWindow()
+      await currentWindow.show()
+      await currentWindow.setFocus()
+    }
+  }, [])
+  const openDailyNotebook = useCallback(async () => {
+    await setStickyWindow(false)
+    setStickyMode(false)
+    setShowStickyHistory(false)
+    setClipboardView(false)
+    setCredentialsView(false)
+  }, [])
+  const openCredentials = useCallback(async () => {
+    await setStickyWindow(true)
+    setStickyMode(false)
+    setClipboardView(false)
+    setShowStickyHistory(false)
+    setCredentialsView(true)
+    if (isTauri()) {
+      const currentWindow = getCurrentWindow()
+      await currentWindow.show()
+      await currentWindow.setFocus()
+    }
+  }, [])
 
   useEffect(() => { void initialize() }, [initialize])
+  useEffect(() => { if (dailyDuplicates) void consolidateDailyNotes() }, [consolidateDailyNotes, dailyDuplicates])
+  useEffect(() => {
+    if (!todayNote) {
+      todayNoteId.current = undefined
+      if (!noteDirty) setNote('')
+      return
+    }
+    const changedDocument = todayNoteId.current !== todayNote.id
+    todayNoteId.current = todayNote.id
+    if (changedDocument || !noteDirty) setNote(todayNote.rawContent)
+  }, [noteDirty, todayNote?.id, todayNote?.rawContent, todayNote?.updatedAt])
   useEffect(() => {
     let stop: () => void = () => {}
     void subscribeToCloudSync((incoming) => { void mergeRemoteClips(incoming) }, setCloudUser).then((unsubscribe) => { stop = unsubscribe })
@@ -147,13 +228,15 @@ export default function App() {
       }
     }
     void reconcile()
-    const interval = window.setInterval(() => { void reconcile() }, 5_000)
+    const interval = window.setInterval(() => { void reconcile() }, 2_000)
     const onVisibilityChange = () => { if (document.visibilityState === 'visible') void reconcile() }
     document.addEventListener('visibilitychange', onVisibilityChange)
+    window.addEventListener('online', reconcile)
     return () => {
       cancelled = true
       window.clearInterval(interval)
       document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.removeEventListener('online', reconcile)
     }
   }, [cloudUser, isReady, mergeRemoteClips])
   useEffect(() => {
@@ -162,7 +245,7 @@ export default function App() {
     if (!changed.length) return
     const timeout = window.setTimeout(() => {
       void pushCloudClips(changed).then(() => changed.forEach((clip) => uploadedRevisions.current.set(clip.id, clip.updatedAt))).catch(() => undefined)
-    }, 350)
+    }, 120)
     return () => window.clearTimeout(timeout)
   }, [clips, cloudReady])
   useEffect(() => {
@@ -171,12 +254,16 @@ export default function App() {
     return () => window.clearTimeout(timeout)
   }, [toast, clearToast])
   useEffect(() => {
-    if (!stickyMode || !note.trim()) return
+    if (!noteDirty || (!note.trim() && !todayNoteId.current)) return
+    const version = editVersion.current
     const timeout = window.setTimeout(() => {
-      void saveStickyNote(note, stickyNoteId.current).then((id) => { if (id) stickyNoteId.current = id })
-    }, 450)
+      void saveStickyNote(note, todayNoteId.current).then((id) => {
+        if (id) todayNoteId.current = id
+        if (editVersion.current === version) setNoteDirty(false)
+      })
+    }, 180)
     return () => window.clearTimeout(timeout)
-  }, [note, saveStickyNote, stickyMode])
+  }, [note, noteDirty, saveStickyNote])
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') setOpenClipId(undefined)
@@ -186,48 +273,58 @@ export default function App() {
   }, [])
   useEffect(() => {
     if (!isTauri()) return
-    let unlistenMonitoring: (() => void) | undefined
-    void listen('clipnote://toggle-monitoring', () => setMonitoring(!useClipStore.getState().isMonitoring)).then((unlisten) => { unlistenMonitoring = unlisten })
-    void register('CommandOrControl+Shift+V', async () => {
-      const currentWindow = getCurrentWindow()
-      await currentWindow.show()
-      await currentWindow.setFocus()
-    })
-    void register('CommandOrControl+Shift+N', () => void toggleStickyMode())
-    return () => { unlistenMonitoring?.(); void unregister('CommandOrControl+Shift+V'); void unregister('CommandOrControl+Shift+N') }
-  }, [setMonitoring, toggleStickyMode])
+    let disposed = false
+    const unlisteners: Array<() => void> = []
+    const addListener = async (event: string, handler: () => void) => {
+      const unlisten = await listen(event, handler)
+      if (disposed) unlisten()
+      else unlisteners.push(unlisten)
+    }
+    void addListener('clipnote://toggle-monitoring', () => setMonitoring(!useClipStore.getState().isMonitoring))
+    void addListener('clipnote://open-sticky', () => void openStickyNote())
+    void addListener('clipnote://open-clipboard', () => void openClipboardHistory())
+    void addListener('clipnote://open-credentials', () => void openCredentials())
+    return () => {
+      disposed = true
+      unlisteners.forEach((unlisten) => unlisten())
+    }
+  }, [openClipboardHistory, openCredentials, openStickyNote, setMonitoring])
 
-  const saveNote = () => {
-    if (!note.trim()) return
-    void addNote(note)
-    setNote('')
-  }
   const deleteLocally = (clip: Clip) => {
     void moveToTrash(clip.id)
     setOpenClipId(undefined)
   }
+  const changeNote = (value: string) => {
+    editVersion.current += 1
+    setNote(value)
+    setNoteDirty(true)
+  }
   if (!isReady) return <div className="boot-screen"><div className="boot-mark"><LoaderCircle size={23} /></div><span>Opening ClipNote…</span></div>
 
-  return <main className={stickyMode ? 'notepad-shell is-sticky' : 'notepad-shell'}>
-    {stickyMode ? <section className="sticky-note-surface" aria-label="Sticky note">
-      <textarea autoFocus value={note} onChange={(event) => setNote(event.target.value)} placeholder="Write anything…" aria-label="Sticky note" />
+  return <main className={credentialsView ? 'notepad-shell is-credentials-compact' : stickyMode ? 'notepad-shell is-sticky' : clipboardView ? 'notepad-shell is-clipboard-compact' : 'notepad-shell'}>
+    {credentialsView ? <CredentialVault onClose={() => void openDailyNotebook()} /> : stickyMode ? <section className="sticky-note-surface" aria-label="Sticky note">
+      <textarea autoFocus value={note} onChange={(event) => changeNote(event.target.value)} placeholder="Write anything…" aria-label="Sticky note" />
       <button className="sticky-history-tab" onClick={() => setShowStickyHistory(!showStickyHistory)} aria-pressed={showStickyHistory}><History size={15} /> History</button>
       <button className="sticky-exit-tab" onClick={() => void toggleStickyMode()} title="Open full timeline"><StickyNote size={15} /></button>
-      {showStickyHistory ? <div className="sticky-history-panel">{clips.filter((clip) => !clip.deletedAt && !clip.isSnippet).slice(0, 8).map((clip) => <div key={clip.id}><time>{formatTime(clip.lastCopiedAt)}</time><span>{clip.isSensitive ? 'Sensitive item' : clip.rawContent}</span></div>)}{clips.length === 0 ? <p>No history yet.</p> : null}</div> : null}
+      {showStickyHistory ? <div className="sticky-history-panel">{clips.filter((clip) => !clip.deletedAt && !clip.isSnippet && !isWrittenNote(clip)).slice(0, 8).map((clip) => <div key={clip.id}><time>{formatTime(clip.lastCopiedAt)}</time><span>{clip.isSensitive ? 'Sensitive item' : clip.rawContent}</span></div>)}{clips.filter((clip) => !clip.deletedAt && !isWrittenNote(clip)).length === 0 ? <p>No copied items yet.</p> : null}</div> : null}
     </section> : <>
-    <section className="notepad-page" aria-label="Clipboard notebook">
-      <div className="note-composer">
-        <textarea value={note} onChange={(event) => setNote(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); saveNote() } }} placeholder="Write a note…" aria-label="Write a note" />
-        <div><span>⌘/Ctrl + Enter to save</span><button onClick={saveNote}><Plus size={15} /> Save note</button></div>
+    <section className={clipboardView ? 'notepad-page is-clipboard-view' : 'notepad-page'} aria-label={clipboardView ? 'Clipboard history' : 'Daily notebook'}>
+      {!clipboardView ? <>
+      <div className="daily-note-label"><strong>Today</strong><span>{cloudReady ? 'Saved automatically' : 'Saving locally'}</span></div>
+      <div className="note-composer daily-note-composer">
+        <textarea value={note} onChange={(event) => changeNote(event.target.value)} placeholder="Start writing…" aria-label="Today’s note" />
       </div>
-      {!isMonitoring ? <p className="notepad-paused"><Pause size={14} fill="currentColor" /> Clipboard monitoring is paused. <button onClick={() => setMonitoring(true)}>Resume</button></p> : null}
+      </> : null}
+      {clipboardView && !isMonitoring ? <p className="notepad-paused"><Pause size={14} fill="currentColor" /> Clipboard monitoring is paused. <button onClick={() => setMonitoring(true)}>Resume</button></p> : null}
       <div className="timeline">
-        {timeline.map(([day, entries]) => <section key={day} className="day-group"><h2>{day}</h2>{entries.map((clip) => <article key={clip.id} className={clip.isSensitive ? 'timeline-entry is-sensitive' : 'timeline-entry'} role="button" tabIndex={0} onClick={() => setOpenClipId(clip.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setOpenClipId(clip.id) } }}><time dateTime={clip.lastCopiedAt}>{formatTime(clip.lastCopiedAt)}</time><div className="timeline-copy"><div className="timeline-entry-meta">{clip.sourceApplication === 'Note' || clip.sourceApplication === 'Mobile note' ? 'Note' : 'Copied'}{clip.isSensitive ? <span><ShieldAlert size={12} /> Protected</span> : null}</div><p>{displayContent(clip)}</p><small>{clip.copyCount > 1 ? `Copied ${clip.copyCount} times · ` : ''}{formatRelativeTime(clip.lastCopiedAt)}</small></div><div className="entry-actions"><button onClick={(event) => { event.stopPropagation(); void copyClip(clip.id) }} title="Copy"><Copy size={14} /></button><button onClick={(event) => { event.stopPropagation(); deleteLocally(clip) }} title="Move to Trash"><Trash2 size={14} /></button></div></article>)}</section>)}
-        {timeline.length === 0 ? <div className="timeline-empty"><Clipboard size={22} /><p>Copy something and it will appear here.</p></div> : null}
+        {timeline.map(([day, entries]) => <section key={day} className="day-group"><h2>{day}</h2>{entries.map((clip) => <article key={clip.id} className={clip.isSensitive ? 'timeline-entry is-sensitive' : 'timeline-entry'} role="button" tabIndex={0} onClick={() => setOpenClipId(clip.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setOpenClipId(clip.id) } }}><time dateTime={clip.updatedAt}>{formatTime(clip.updatedAt)}</time><div className="timeline-copy"><div className="timeline-entry-meta">{isWrittenNote(clip) ? 'Daily note' : 'Copied'}{clip.isSensitive ? <span><ShieldAlert size={12} /> Protected</span> : null}</div><p>{displayContent(clip)}</p><small>{isWrittenNote(clip) ? `Updated ${formatRelativeTime(clip.updatedAt)}` : `${clip.copyCount > 1 ? `Copied ${clip.copyCount} times · ` : ''}${formatRelativeTime(clip.lastCopiedAt)}`}</small></div><div className="entry-actions"><button onClick={(event) => { event.stopPropagation(); void copyClip(clip.id) }} title="Copy"><Copy size={14} /></button><button onClick={(event) => { event.stopPropagation(); deleteLocally(clip) }} title="Delete"><Trash2 size={14} /></button></div></article>)}</section>)}
+        {timeline.length === 0 && (clipboardView || !todayNote) ? <div className="timeline-empty"><Clipboard size={22} /><p>{clipboardView ? 'Copy something and it will appear here automatically.' : 'Previous daily notes will appear here.'}</p></div> : null}
       </div>
     </section>
     <button className="sticky-mode-tab" onClick={() => void toggleStickyMode()}><StickyNote size={15} /> Sticky Note</button>
+    <button className="clipboard-mode-tab" onClick={() => { if (clipboardView) void openDailyNotebook(); else void openClipboardHistory() }}>{clipboardView ? <><StickyNote size={15} /> Daily Note</> : <><Clipboard size={15} /> Clipboard</>}</button>
     {isCloudSyncConfigured() ? <button className="sync-mode-tab" onClick={() => setShowSyncPanel(true)}><Smartphone size={15} />{cloudUser ? (cloudReady ? 'Synced' : 'Connecting…') : 'Sync phone'}</button> : null}
+    <button className="credentials-mode-tab" onClick={() => void openCredentials()} title="Open Creds (Shift + Command + ,)"><KeyRound size={15} /> Creds</button>
     </>}
     {error ? <div className="app-error">{error}</div> : null}
     {toast ? <div className="toast"><Copy size={15} />{toast}</div> : null}

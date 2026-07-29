@@ -22,6 +22,7 @@ interface ClipState {
   ingestText: (text: string, sourceApplication?: string) => Promise<void>
   addNote: (text: string) => Promise<string | undefined>
   saveStickyNote: (text: string, id?: string) => Promise<string | undefined>
+  consolidateDailyNotes: () => Promise<void>
   updateClip: (id: string, patch: Partial<Clip>) => Promise<void>
   copyClip: (id: string) => Promise<void>
   duplicateClip: (id: string) => Promise<void>
@@ -68,9 +69,9 @@ function findTodayNote(clips: Clip[]) {
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())[0]
 }
 
-function appendTimestampedEntry(current: string, text: string, timestamp: string) {
-  const time = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(timestamp))
-  return `${current.trimEnd()}${current.trim() ? '\n\n' : ''}${time}\n${text.trim()}`
+function localDayKey(value: string) {
+  const date = new Date(value)
+  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`
 }
 
 function createClip(text: string, settings: ClipSettings, sourceApplication?: string): Clip {
@@ -142,36 +143,6 @@ export const useClipStore = create<ClipState>((set, get) => ({
     if (!text.trim() || !get().isMonitoring) return
     if (sourceApplication && settings.excludedApplications.some((entry) => entry.toLocaleLowerCase() === sourceApplication.toLocaleLowerCase())) return
     const now = toIsoDate()
-    const clip = createClip(text, settings, sourceApplication)
-
-    // Keep ordinary clipboard captures in one document per calendar day. Each
-    // capture is appended with its time so the day still reads chronologically.
-    // Sensitive/expiring values remain isolated so they can expire safely.
-    if (!clip.isSensitive && !clip.expiresAt) {
-      const current = findTodayNote(clips)
-      const rawContent = appendTimestampedEntry(current?.rawContent ?? '', text, now)
-      const daily: Clip = current ? {
-        ...current,
-        rawContent,
-        normalizedContent: normalize(rawContent),
-        title: suggestedTitle(rawContent, 'text'),
-        sourceApplication: 'Daily note',
-        updatedAt: now,
-        lastCopiedAt: now,
-        copyCount: current.copyCount + 1,
-      } : {
-        ...clip,
-        rawContent,
-        normalizedContent: normalize(rawContent),
-        title: suggestedTitle(rawContent, 'text'),
-        contentType: 'text',
-        sourceApplication: 'Daily note',
-      }
-      await persist(daily)
-      set({ clips: orderClips([daily, ...clips.filter((entry) => entry.id !== daily.id)]) })
-      return
-    }
-
     const existing = clips.find((entry) => !entry.deletedAt && !entry.isSnippet && entry.rawContent === text)
     if (existing) {
       const updated = updateRepeatedCopy(existing, now)
@@ -179,6 +150,7 @@ export const useClipStore = create<ClipState>((set, get) => ({
       set({ clips: orderClips([updated, ...clips.filter((entry) => entry.id !== existing.id)]) })
       return
     }
+    const clip = createClip(text, settings, sourceApplication)
     await persist(clip)
     const next = [clip, ...clips]
     const overflowIds = await trimHistory(next, settings)
@@ -209,6 +181,46 @@ export const useClipStore = create<ClipState>((set, get) => ({
     await persist(note)
     set({ clips: orderClips([note, ...get().clips]), toast: 'Note saved' })
     return note.id
+  },
+  async consolidateDailyNotes() {
+    const currentClips = get().clips
+    const groups = new Map<string, Clip[]>()
+    currentClips.filter((clip) => !clip.deletedAt && !clip.isSnippet && isWrittenNote(clip)).forEach((clip) => {
+      const key = localDayKey(clip.createdAt)
+      groups.set(key, [...(groups.get(key) ?? []), clip])
+    })
+    const replacements = new Map<string, Clip>()
+    const now = toIsoDate()
+    for (const entries of groups.values()) {
+      if (entries.length < 2) continue
+      const canonical = [...entries].sort((a, b) => {
+        const sourceRank = Number(b.sourceApplication === 'Daily note') - Number(a.sourceApplication === 'Daily note')
+        return sourceRank || new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+      })[0]
+      let rawContent = canonical.rawContent.trim()
+      for (const entry of [...entries].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())) {
+        const content = entry.rawContent.trim()
+        if (!content || entry.id === canonical.id || rawContent.includes(content)) continue
+        rawContent += `${rawContent ? '\n\n' : ''}${content}`
+      }
+      const merged: Clip = {
+        ...canonical,
+        rawContent,
+        normalizedContent: normalize(rawContent),
+        title: rawContent ? suggestedTitle(rawContent, 'text') : 'Daily note',
+        contentType: 'text',
+        sourceApplication: 'Daily note',
+        updatedAt: now,
+        lastCopiedAt: now,
+      }
+      replacements.set(merged.id, merged)
+      for (const entry of entries) {
+        if (entry.id !== merged.id) replacements.set(entry.id, markTrashed(entry, now))
+      }
+    }
+    if (!replacements.size) return
+    await Promise.all([...replacements.values()].map(persist))
+    set({ clips: orderClips(currentClips.map((clip) => replacements.get(clip.id) ?? clip)) })
   },
   async updateClip(id, patch) {
     const current = get().clips.find((clip) => clip.id === id)

@@ -6,6 +6,7 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Emitter, LogicalSize, Manager, RunEvent, Size, WebviewWindow, WindowEvent,
 };
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +30,91 @@ struct Clip {
     ocr_text: Option<String>,
     deleted_at: Option<String>,
     is_snippet: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Credential {
+    id: String,
+    label: String,
+    url: String,
+    username: String,
+    password: String,
+    updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialSummary {
+    id: String,
+    label: String,
+    url: String,
+    username: String,
+    updated_at: String,
+}
+
+impl From<&Credential> for CredentialSummary {
+    fn from(credential: &Credential) -> Self {
+        Self {
+            id: credential.id.clone(),
+            label: credential.label.clone(),
+            url: credential.url.clone(),
+            username: credential.username.clone(),
+            updated_at: credential.updated_at.clone(),
+        }
+    }
+}
+
+const CREDENTIAL_KEYCHAIN_SERVICE: &str = "com.clipnote.desktop.credentials";
+const CREDENTIAL_KEYCHAIN_ACCOUNT: &str = "vault";
+
+fn validate_credential(credential: &Credential) -> Result<(), String> {
+    if credential.id.is_empty()
+        || credential.id.len() > 128
+        || credential.label.trim().is_empty()
+        || credential.label.len() > 200
+        || credential.url.len() > 2_048
+        || credential.username.len() > 512
+        || credential.password.is_empty()
+        || credential.password.len() > 32_768
+        || credential.updated_at.len() > 64
+    {
+        return Err("Credential is incomplete or too large".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn read_credential_vault() -> Result<Vec<Credential>, String> {
+    use security_framework::passwords::get_generic_password;
+
+    match get_generic_password(CREDENTIAL_KEYCHAIN_SERVICE, CREDENTIAL_KEYCHAIN_ACCOUNT) {
+        Ok(data) => serde_json::from_slice(&data).map_err(|_| "Unable to read credentials from macOS Keychain".to_string()),
+        Err(error) if error.code() == -25_300 => Ok(Vec::new()),
+        Err(_) => Err("Unable to access credentials in macOS Keychain".to_string()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_credential_vault() -> Result<Vec<Credential>, String> {
+    Err("Secure credential storage is currently available in the macOS app".into())
+}
+
+#[cfg(target_os = "macos")]
+fn write_credential_vault(credentials: &[Credential]) -> Result<(), String> {
+    use security_framework::passwords::set_generic_password;
+
+    let data = serde_json::to_vec(credentials).map_err(|_| "Unable to prepare credentials for macOS Keychain".to_string())?;
+    if data.len() > 1_000_000 {
+        return Err("Credential vault is too large".into());
+    }
+    set_generic_password(CREDENTIAL_KEYCHAIN_SERVICE, CREDENTIAL_KEYCHAIN_ACCOUNT, &data)
+        .map_err(|_| "Unable to save credentials in macOS Keychain".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_credential_vault(_credentials: &[Credential]) -> Result<(), String> {
+    Err("Secure credential storage is currently available in the macOS app".into())
 }
 
 const SCHEMA: &str = r#"
@@ -173,6 +259,54 @@ fn clips_clear(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn credentials_list() -> Result<Vec<CredentialSummary>, String> {
+    let mut credentials = read_credential_vault()?;
+    credentials.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    Ok(credentials.iter().map(CredentialSummary::from).collect())
+}
+
+#[tauri::command]
+fn credential_get(id: String) -> Result<Credential, String> {
+    if id.is_empty() || id.len() > 128 {
+        return Err("Invalid credential".into());
+    }
+    read_credential_vault()?
+        .into_iter()
+        .find(|credential| credential.id == id)
+        .ok_or_else(|| "Credential was not found".to_string())
+}
+
+#[tauri::command]
+fn credential_save(credential: Credential) -> Result<CredentialSummary, String> {
+    validate_credential(&credential)?;
+    let mut credentials = read_credential_vault()?;
+    if let Some(existing) = credentials.iter_mut().find(|existing| existing.id == credential.id) {
+        *existing = credential.clone();
+    } else {
+        if credentials.len() >= 500 {
+            return Err("Credential vault has reached its 500-item limit".into());
+        }
+        credentials.push(credential.clone());
+    }
+    write_credential_vault(&credentials)?;
+    Ok(CredentialSummary::from(&credential))
+}
+
+#[tauri::command]
+fn credential_delete(id: String) -> Result<(), String> {
+    if id.is_empty() || id.len() > 128 {
+        return Err("Invalid credential".into());
+    }
+    let mut credentials = read_credential_vault()?;
+    let original_len = credentials.len();
+    credentials.retain(|credential| credential.id != id);
+    if credentials.len() == original_len {
+        return Err("Credential was not found".into());
+    }
+    write_credential_vault(&credentials)
+}
+
+#[tauri::command]
 fn open_data_folder(app: AppHandle) -> Result<(), String> {
     let data_dir = app_data_dir(&app)?;
     #[cfg(target_os = "macos")]
@@ -200,6 +334,34 @@ fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+fn register_global_shortcuts(app: &AppHandle) {
+    let shortcuts = app.global_shortcut();
+    if let Err(error) = shortcuts.on_shortcut("CommandOrControl+Shift+Space", |app, _, event| {
+        if event.state == ShortcutState::Pressed {
+            show_main_window(app);
+            let _ = app.emit("clipnote://open-sticky", ());
+        }
+    }) {
+        eprintln!("Unable to register Sticky Note shortcut: {error}");
+    }
+    if let Err(error) = shortcuts.on_shortcut("CommandOrControl+Shift+V", |app, _, event| {
+        if event.state == ShortcutState::Pressed {
+            show_main_window(app);
+            let _ = app.emit("clipnote://open-clipboard", ());
+        }
+    }) {
+        eprintln!("Unable to register Clipboard shortcut: {error}");
+    }
+    if let Err(error) = shortcuts.on_shortcut("CommandOrControl+Shift+Comma", |app, _, event| {
+        if event.state == ShortcutState::Pressed {
+            show_main_window(app);
+            let _ = app.emit("clipnote://open-credentials", ());
+        }
+    }) {
+        eprintln!("Unable to register Creds shortcut: {error}");
     }
 }
 
@@ -232,9 +394,21 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             setup_tray(app.handle())?;
+            register_global_shortcuts(app.handle());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![clips_list, clips_upsert, clips_remove_permanently, clips_clear, open_data_folder, set_sticky_mode])
+        .invoke_handler(tauri::generate_handler![
+            clips_list,
+            clips_upsert,
+            clips_remove_permanently,
+            clips_clear,
+            credentials_list,
+            credential_get,
+            credential_save,
+            credential_delete,
+            open_data_folder,
+            set_sticky_mode
+        ])
         .build(tauri::generate_context!())
         .expect("error while building ClipNote");
 
