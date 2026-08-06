@@ -1,6 +1,6 @@
 import { ArrowLeft, Copy, Eye, EyeOff, KeyRound, LoaderCircle, Plus, Save, StickyNote, Trash2, UserRound } from 'lucide-react'
 import { type FormEvent, useCallback, useEffect, useState } from 'react'
-import { copyCredentialSecret, systemClipboardProvider } from '../services/clipboardProvider'
+import { systemClipboardProvider } from '../services/clipboardProvider'
 import { deleteCredential, getCredential, listCredentials, saveCredential, type Credential, type CredentialSummary } from '../services/credentialService'
 import { dismissAfterCopy } from '../services/nativeService'
 
@@ -70,7 +70,7 @@ export function CredentialVault({ onClose }: { onClose: () => void }) {
       setDraft(undefined)
       setRevealPassword(false)
       await refresh()
-      setNotice('Saved in macOS Keychain.')
+      setNotice('Credential saved.')
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
       setBusy(false)
@@ -85,10 +85,9 @@ export function CredentialVault({ onClose }: { onClose: () => void }) {
         setNotice(`No ${field} saved.`)
         return
       }
-      if (field === 'password') await copyCredentialSecret(value)
-      else await systemClipboardProvider.write(value)
+      await systemClipboardProvider.write(value)
       await dismissAfterCopy()
-      setNotice(field === 'password' ? 'Password copied for 60 seconds. Not added to history.' : 'Username copied. Not added to history.')
+      setNotice(`${field === 'password' ? 'Password' : 'Username'} copied. Not added to history.`)
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
     }
@@ -108,7 +107,7 @@ export function CredentialVault({ onClose }: { onClose: () => void }) {
 
   return <section className="credential-vault" aria-label="Credentials">
     <div className="credential-toolbar">
-      <div><KeyRound size={15} /><strong>Creds</strong><span>macOS Keychain</span></div>
+      <div><KeyRound size={15} /><strong>Creds</strong><span>Saved locally</span></div>
       <div>
         {!draft ? <button onClick={() => { setDraft(emptyCredential()); setNotice(undefined) }} title="Add credential"><Plus size={16} /></button> : null}
         <button onClick={onClose} title="Open daily note"><StickyNote size={15} /></button>
@@ -121,9 +120,9 @@ export function CredentialVault({ onClose }: { onClose: () => void }) {
       <label>Website URL<input inputMode="url" autoComplete="url" value={draft.url} onChange={(event) => setDraft({ ...draft, url: event.target.value })} placeholder="example.com" /></label>
       <label>Username or email<input autoComplete="username" value={draft.username} onChange={(event) => setDraft({ ...draft, username: event.target.value })} placeholder="developer@example.com" /></label>
       <label>Password<div className="credential-password-input"><input type={revealPassword ? 'text' : 'password'} autoComplete="current-password" value={draft.password} onChange={(event) => setDraft({ ...draft, password: event.target.value })} placeholder="Password" /><button type="button" onClick={() => setRevealPassword(!revealPassword)} aria-label={revealPassword ? 'Hide password' : 'Show password'}>{revealPassword ? <EyeOff size={15} /> : <Eye size={15} />}</button></div></label>
-      <button className="credential-save" type="submit" disabled={busy}><Save size={14} /> Save to Keychain</button>
+      <button className="credential-save" type="submit" disabled={busy}><Save size={14} /> Save</button>
     </form> : <div className="credential-list">
-      {busy ? <div className="credential-empty"><LoaderCircle className="credential-spinner" size={20} /> Opening Keychain…</div> : null}
+      {busy ? <div className="credential-empty"><LoaderCircle className="credential-spinner" size={20} /> Loading…</div> : null}
       {!busy && credentials.length === 0 ? <div className="credential-empty"><KeyRound size={22} /><strong>No credentials yet</strong><span>Add a website or dev app login.</span><button onClick={() => setDraft(emptyCredential())}><Plus size={14} /> Add credential</button></div> : null}
       {!busy ? credentials.map((credential) => <article className="credential-row" key={credential.id}>
         <button className="credential-row-main" onClick={() => void edit(credential.id)}>
@@ -137,6 +136,6 @@ export function CredentialVault({ onClose }: { onClose: () => void }) {
         </div>
       </article>) : null}
     </div>}
-    <div className={notice?.toLowerCase().includes('unable') || notice?.toLowerCase().includes('invalid') ? 'credential-notice is-error' : 'credential-notice'}>{notice ?? 'Credentials stay local on this Mac and never sync.'}</div>
+    <div className={notice?.toLowerCase().includes('unable') || notice?.toLowerCase().includes('invalid') ? 'credential-notice is-error' : 'credential-notice'}>{notice ?? 'Credentials stay local and never sync.'}</div>
   </section>
 }

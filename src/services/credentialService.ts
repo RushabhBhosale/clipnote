@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+const storageKey = 'clipnote:credentials:v1'
 
 export interface CredentialSummary {
   id: string
@@ -12,28 +12,43 @@ export interface Credential extends CredentialSummary {
   password: string
 }
 
-function requireDesktop() {
-  if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) {
-    throw new Error('Credentials are available in the macOS app.')
+function loadCredentials(): Credential[] {
+  if (typeof localStorage === 'undefined') return []
+  try {
+    return JSON.parse(localStorage.getItem(storageKey) ?? '[]') as Credential[]
+  } catch {
+    return []
   }
 }
 
-export async function listCredentials() {
-  requireDesktop()
-  return invoke<CredentialSummary[]>('credentials_list')
+function saveCredentials(credentials: Credential[]) {
+  if (typeof localStorage === 'undefined') return
+  localStorage.setItem(storageKey, JSON.stringify(credentials))
 }
 
-export async function getCredential(id: string) {
-  requireDesktop()
-  return invoke<Credential>('credential_get', { id })
+export async function listCredentials(): Promise<CredentialSummary[]> {
+  const credentials = loadCredentials()
+  return credentials.map(({ password: _, ...rest }) => rest)
 }
 
-export async function saveCredential(credential: Credential) {
-  requireDesktop()
-  return invoke<CredentialSummary>('credential_save', { credential })
+export async function getCredential(id: string): Promise<Credential> {
+  const credentials = loadCredentials()
+  const found = credentials.find((c) => c.id === id)
+  if (!found) throw new Error('Credential not found.')
+  return found
 }
 
-export async function deleteCredential(id: string) {
-  requireDesktop()
-  await invoke('credential_delete', { id })
+export async function saveCredential(credential: Credential): Promise<CredentialSummary> {
+  const credentials = loadCredentials()
+  const idx = credentials.findIndex((c) => c.id === credential.id)
+  if (idx >= 0) credentials[idx] = credential
+  else credentials.push(credential)
+  saveCredentials(credentials)
+  const { password: _, ...rest } = credential
+  return rest
+}
+
+export async function deleteCredential(id: string): Promise<void> {
+  const credentials = loadCredentials()
+  saveCredentials(credentials.filter((c) => c.id !== id))
 }

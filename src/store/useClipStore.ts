@@ -24,7 +24,8 @@ interface ClipState {
   ingestText: (text: string, sourceApplication?: string) => Promise<void>
   ingestImage: (payload: ClipboardImagePayload, sourceApplication?: string) => Promise<void>
   addNote: (text: string) => Promise<string | undefined>
-  saveStickyNote: (text: string, id?: string) => Promise<string | undefined>
+  createNote: (text: string, title?: string, color?: string) => Promise<string | undefined>
+  saveStickyNote: (text: string, id?: string, title?: string) => Promise<string | undefined>
   consolidateDailyNotes: () => Promise<void>
   updateClip: (id: string, patch: Partial<Clip>) => Promise<void>
   copyClip: (id: string) => Promise<void>
@@ -60,16 +61,6 @@ function normalize(value: string) {
 
 function isWrittenNote(clip: Clip) {
   return clip.sourceApplication === 'Note' || clip.sourceApplication === 'Mobile note' || clip.sourceApplication === 'Daily note'
-}
-
-function isToday(value: string) {
-  return new Date(value).toDateString() === new Date().toDateString()
-}
-
-function findTodayNote(clips: Clip[]) {
-  return clips
-    .filter((clip) => !clip.deletedAt && !clip.isSnippet && isWrittenNote(clip) && isToday(clip.createdAt))
-    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())[0]
 }
 
 function localDayKey(value: string) {
@@ -199,8 +190,17 @@ export const useClipStore = create<ClipState>((set, get) => ({
   async addNote(text) {
     return get().saveStickyNote(text)
   },
-  async saveStickyNote(text, id) {
-    const current = (id ? get().clips.find((clip) => clip.id === id && isWrittenNote(clip)) : undefined) ?? findTodayNote(get().clips)
+  async createNote(text, title, color) {
+    if (!text.trim()) return undefined
+    const note = createClip(text, get().settings, 'Daily note')
+    note.title = title && title.trim() ? title.trim() : note.title
+    if (color) note.color = color
+    await persist(note)
+    set({ clips: orderClips([note, ...get().clips]), toast: 'Note added' })
+    return note.id
+  },
+  async saveStickyNote(text, id, title) {
+    const current = id ? get().clips.find((clip) => clip.id === id && isWrittenNote(clip)) : undefined
     if (!text.trim() && !current) return undefined
     if (current) {
       const now = toIsoDate()
@@ -208,7 +208,7 @@ export const useClipStore = create<ClipState>((set, get) => ({
         ...current,
         rawContent: text,
         normalizedContent: normalize(text),
-        title: text.trim() ? suggestedTitle(text, 'text') : 'Today',
+        title: title !== undefined ? title : (text.trim() ? suggestedTitle(text, 'text') : 'Today'),
         sourceApplication: 'Daily note',
         updatedAt: now,
         lastCopiedAt: now,
@@ -218,6 +218,7 @@ export const useClipStore = create<ClipState>((set, get) => ({
       return current.id
     }
     const note = createClip(text, get().settings, 'Daily note')
+    if (title !== undefined) note.title = title
     await persist(note)
     set({ clips: orderClips([note, ...get().clips]), toast: 'Note saved' })
     return note.id
@@ -348,6 +349,7 @@ export const useClipStore = create<ClipState>((set, get) => ({
         tags: Array.isArray(source.tags) ? source.tags.filter((tag): tag is string => typeof tag === 'string' && tag.length <= 100).slice(0, 50) : [],
         isFavorite: Boolean(source.isFavorite),
         isSnippet: Boolean(source.isSnippet),
+        color: typeof source.color === 'string' ? source.color : undefined,
       }
       if (hasExpired(next)) return []
       knownIds.add(id)

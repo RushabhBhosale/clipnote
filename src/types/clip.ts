@@ -32,6 +32,7 @@ export interface Clip {
   isSensitive: boolean
   expiresAt?: string
   tags: string[]
+  color?: string
   detectedLanguage?: string
   imagePath?: string
   ocrText?: string
