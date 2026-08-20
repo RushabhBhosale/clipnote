@@ -1,15 +1,13 @@
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { Clipboard, Cloud, Copy, KeyRound, LoaderCircle, LogOut, Pause, Plus, Search, ShieldAlert, Smartphone, StickyNote, Trash2, X } from 'lucide-react'
+import { Clipboard, Copy, KeyRound, LoaderCircle, Pause, Plus, Search, ShieldAlert, StickyNote, Trash2, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { User } from '@supabase/supabase-js'
 import { CredentialVault } from './components/CredentialVault'
 import { NotesBoard } from './components/NotesBoard'
 import { RichTextEditor } from './components/RichTextEditor'
 import { richTextPlainText } from './features/notes/richText'
 import { maskSensitiveContent } from './features/sensitive-content/detector'
 import { formatRelativeTime } from './lib/utils'
-import { isCloudSyncConfigured, pullCloudClips, pushCloudClips, signInWithPassword, signOutOfCloudSync, signUpWithPassword, subscribeToCloudSync } from './services/syncService'
 import { useClipStore } from './store/useClipStore'
 import type { Clip } from './types/clip'
 import { hideClipNote, setStickyWindow, showClipNote } from './services/nativeService'
@@ -45,49 +43,6 @@ function isWrittenNote(clip: Clip) {
   return clip.sourceApplication === 'Note' || clip.sourceApplication === 'Mobile note' || clip.sourceApplication === 'Daily note'
 }
 
-function SyncPanel({ user, onClose }: { user?: User, onClose: () => void }) {
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [status, setStatus] = useState<string>()
-  const [busy, setBusy] = useState(false)
-
-  const submit = async (mode: 'sign-in' | 'sign-up') => {
-    if (!email.trim() || !password) return setStatus('Enter your email and password.')
-    setBusy(true)
-    setStatus(undefined)
-    try {
-      if (mode === 'sign-in') await signInWithPassword(email.trim(), password)
-      else {
-        await signUpWithPassword(email.trim(), password)
-        setStatus('Account created. Check your email if confirmation is enabled, then sign in on both devices.')
-      }
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Could not connect your account.')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return <div className="sync-panel-backdrop" role="presentation" onMouseDown={onClose}>
-    <section className="sync-panel" role="dialog" aria-modal="true" aria-label="Sync with your phone" onMouseDown={(event) => event.stopPropagation()}>
-      <button className="sync-panel-close" onClick={onClose} aria-label="Close sync panel"><X size={18} /></button>
-      <div className="sync-panel-icon"><Cloud size={19} /></div>
-      <h2>{user ? 'Your notes are syncing' : 'Sync with your phone'}</h2>
-      {user ? <>
-        <p>Signed in as {user.email}. Use this same account in the ClipNote mobile app.</p>
-        <button className="sync-sign-out" onClick={() => void signOutOfCloudSync()}><LogOut size={15} /> Sign out</button>
-      </> : <>
-        <p>Sign in with the same account on your laptop and phone. New notes appear on both devices automatically.</p>
-        <label>Email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" /></label>
-        <label>Password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 6 characters" /></label>
-        {status ? <p className="sync-panel-status">{status}</p> : null}
-        <div className="sync-panel-actions"><button disabled={busy} onClick={() => void submit('sign-in')}>Sign in</button><button disabled={busy} className="secondary" onClick={() => void submit('sign-up')}>Create account</button></div>
-      </>}
-      <small>Protected clipboard items and temporary codes stay only on the device that captured them.</small>
-    </section>
-  </div>
-}
-
 export default function App() {
   const clips = useClipStore((state) => state.clips)
   const isMonitoring = useClipStore((state) => state.isMonitoring)
@@ -101,7 +56,6 @@ export default function App() {
   const copyText = useClipStore((state) => state.copyText)
   const addActionResult = useClipStore((state) => state.addActionResult)
   const moveToTrash = useClipStore((state) => state.moveToTrash)
-  const mergeRemoteClips = useClipStore((state) => state.mergeRemoteClips)
   const clearToast = useClipStore((state) => state.clearToast)
   const [note, setNote] = useState('')
   const [noteTitle, setNoteTitle] = useState('')
@@ -110,15 +64,11 @@ export default function App() {
   const [clipboardView, setClipboardView] = useState(false)
   const [clipboardQuery, setClipboardQuery] = useState('')
   const [credentialsView, setCredentialsView] = useState(false)
-  const [cloudUser, setCloudUser] = useState<User>()
-  const [cloudReady, setCloudReady] = useState(false)
-  const [showSyncPanel, setShowSyncPanel] = useState(false)
   const [noteDirty, setNoteDirty] = useState(false)
   const [stickyPickerOpen, setStickyPickerOpen] = useState(false)
   const todayNoteId = useRef<string | undefined>(undefined)
   const lastEditedNoteRef = useRef<string | undefined>(undefined)
   const editVersion = useRef(0)
-  const uploadedRevisions = useRef(new Map<string, string>())
   const stickyNotes = useMemo(() => clips
     .filter((clip) => !clip.deletedAt && !clip.isSnippet && isWrittenNote(clip))
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()), [clips])
@@ -218,55 +168,6 @@ export default function App() {
 
   useEffect(() => { void initialize() }, [initialize])
   useEffect(() => {
-    let stop: () => void = () => {}
-    void subscribeToCloudSync((incoming) => { void mergeRemoteClips(incoming) }, setCloudUser).then((unsubscribe) => { stop = unsubscribe })
-    return () => stop()
-  }, [mergeRemoteClips])
-  useEffect(() => {
-    if (!isReady || !cloudUser) {
-      setCloudReady(false)
-      return
-    }
-    let cancelled = false
-    let syncing = false
-    uploadedRevisions.current.clear()
-    setCloudReady(false)
-    const reconcile = async () => {
-      if (syncing || cancelled) return
-      syncing = true
-      try {
-        // Realtime is the fast path. This quiet reconciliation is the safety
-        // net for a sleeping network/WebSocket and never needs user input.
-        await mergeRemoteClips(await pullCloudClips())
-        if (!cancelled) setCloudReady(true)
-      } catch {
-        if (!cancelled) setCloudReady(false)
-      } finally {
-        syncing = false
-      }
-    }
-    void reconcile()
-    const interval = window.setInterval(() => { void reconcile() }, 2_000)
-    const onVisibilityChange = () => { if (document.visibilityState === 'visible') void reconcile() }
-    document.addEventListener('visibilitychange', onVisibilityChange)
-    window.addEventListener('online', reconcile)
-    return () => {
-      cancelled = true
-      window.clearInterval(interval)
-      document.removeEventListener('visibilitychange', onVisibilityChange)
-      window.removeEventListener('online', reconcile)
-    }
-  }, [cloudUser, isReady, mergeRemoteClips])
-  useEffect(() => {
-    if (!cloudReady) return
-    const changed = clips.filter((clip) => !clip.isSensitive && clip.contentType !== 'image' && uploadedRevisions.current.get(clip.id) !== clip.updatedAt)
-    if (!changed.length) return
-    const timeout = window.setTimeout(() => {
-      void pushCloudClips(changed).then(() => changed.forEach((clip) => uploadedRevisions.current.set(clip.id, clip.updatedAt))).catch(() => undefined)
-    }, 120)
-    return () => window.clearTimeout(timeout)
-  }, [clips, cloudReady])
-  useEffect(() => {
     if (!toast) return
     const timeout = window.setTimeout(clearToast, 1800)
     return () => window.clearTimeout(timeout)
@@ -342,16 +243,14 @@ export default function App() {
       {clipboardView ? <><div className="clipboard-smart-search"><Search size={14} /><input value={clipboardQuery} onChange={(event) => setClipboardQuery(event.target.value)} placeholder="Search text, type, domain, or metadata" aria-label="Search clipboard history" />{clipboardQuery ? <button onClick={() => setClipboardQuery('')} aria-label="Clear search"><X size={13} /></button> : null}</div><div className="timeline">
         {timeline.map(([day, entries]) => <section key={day} className="day-group"><h2>{day}</h2>{entries.map((clip) => { const detection = clip.contentType === 'image' ? undefined : actionEngine.detect(clip.rawContent); return <article key={clip.id} className={clip.isSensitive ? 'timeline-entry is-sensitive' : 'timeline-entry'} role="button" tabIndex={0} onClick={() => setOpenClipId(clip.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setOpenClipId(clip.id) } }}><time dateTime={clip.updatedAt}>{formatTime(clip.updatedAt)}</time><div className="timeline-copy"><div className="timeline-entry-meta">Copied{detection ? <SmartTypeBadge detection={detection} /> : null}{clip.isSensitive ? <span><ShieldAlert size={12} /> Protected</span> : null}</div>{detection ? <SmartPreview detection={detection} /> : null}{clip.contentType === 'image' && clip.imagePath ? <img className="timeline-image" src={localImageUrl(clip.imagePath)} alt={clip.title} /> : <p>{displayContent(clip)}</p>}<small>{clip.copyCount > 1 ? `Copied ${clip.copyCount} times · ` : ''}{formatRelativeTime(clip.lastCopiedAt)}</small></div><div className="entry-actions"><button onClick={(event) => { event.stopPropagation(); void copyClip(clip.id) }} title="Copy"><Copy size={14} /></button><button onClick={(event) => { event.stopPropagation(); deleteLocally(clip) }} title="Delete"><Trash2 size={14} /></button></div></article> })}</section>)}
         {timeline.length === 0 ? <div className="timeline-empty"><Clipboard size={22} /><p>{clipboardQuery ? 'No clipboard items match this search.' : 'Copy something and it will appear here automatically.'}</p></div> : null}
-      </div></> : <NotesBoard />}
+      </div></> : <NotesBoard onOpenClip={(clip) => setOpenClipId(clip.id)} onOpenClipboard={() => void openClipboardHistory()} onOpenSticky={() => void openStickyNote()} />}
     </section>
     <button className="sticky-mode-tab" onClick={() => void openStickyNote()}><StickyNote size={15} /> Sticky Note</button>
     <button className="clipboard-mode-tab" onClick={() => { if (clipboardView) void openDailyNotebook(); else void openClipboardHistory() }}>{clipboardView ? <><StickyNote size={15} /> Daily Note</> : <><Clipboard size={15} /> Clipboard</>}</button>
-    {isCloudSyncConfigured() ? <button className="sync-mode-tab" onClick={() => setShowSyncPanel(true)}><Smartphone size={15} />{cloudUser ? (cloudReady ? 'Synced' : 'Connecting…') : 'Sync phone'}</button> : null}
     <button className="credentials-mode-tab" onClick={() => void openCredentials()} title="Open Creds (Shift + Command + ,)"><KeyRound size={15} /> Creds</button>
     </>}
     {error ? <div className="app-error">{error}</div> : null}
     {toast ? <div className="toast"><Copy size={15} />{toast}</div> : null}
     {openClip ? <div className="clip-modal-backdrop" role="presentation" onMouseDown={() => setOpenClipId(undefined)}><section className="clip-modal" role="dialog" aria-modal="true" aria-label="Clipboard note" onMouseDown={(event) => event.stopPropagation()}><header><div className="clip-modal-header-text"><strong className="clip-modal-title">{openClip.title || 'Untitled'}</strong><time dateTime={openClip.lastCopiedAt}>{new Intl.DateTimeFormat(undefined, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }).format(new Date(openClip.lastCopiedAt))}</time></div><button onClick={() => setOpenClipId(undefined)} aria-label="Close note"><X size={20} /></button></header><div className="clip-modal-content">{openClip.contentType === 'image' && openClip.imagePath ? <img className="clip-modal-image" src={localImageUrl(openClip.imagePath)} alt={openClip.title} /> : openClipDetection?.type === 'json' ? <JsonInlineView content={openClip.rawContent} /> : <><p>{displayContent(openClip)}</p><SmartActionsPanel clip={openClip} onCopyText={copyText} onCreateResult={addActionResult} /></>}</div><footer><button onClick={() => void copyClip(openClip.id)}><Copy size={15} /> Copy</button><button className="modal-delete" onClick={() => deleteLocally(openClip)}><Trash2 size={15} /> Delete</button></footer></section></div> : null}
-    {showSyncPanel ? <SyncPanel user={cloudUser} onClose={() => setShowSyncPanel(false)} /> : null}
   </main>
 }

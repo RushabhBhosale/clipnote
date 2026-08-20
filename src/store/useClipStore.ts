@@ -43,7 +43,6 @@ interface ClipState {
   emptyTrash: () => Promise<void>
   clearHistory: () => Promise<void>
   importClips: (entries: unknown[]) => Promise<void>
-  mergeRemoteClips: (entries: Clip[]) => Promise<void>
   purgeExpiredImages: () => Promise<void>
   updateSettings: (patch: Partial<ClipSettings>) => void
   clearToast: () => void
@@ -408,20 +407,6 @@ export const useClipStore = create<ClipState>((set, get) => ({
     })
     await Promise.all(imported.map(persist))
     set({ clips: orderClips([...imported, ...current]), toast: imported.length ? `${imported.length} clips imported` : 'No valid clips found in that backup' })
-  },
-  async mergeRemoteClips(entries) {
-    const current = get().clips
-    const byId = new Map(current.map((clip) => [clip.id, clip]))
-    let changed = false
-    for (const incoming of entries) {
-      if (incoming.isSensitive || incoming.contentType === 'image' || hasExpired(incoming)) continue
-      const local = byId.get(incoming.id)
-      if (local && new Date(local.updatedAt).getTime() >= new Date(incoming.updatedAt).getTime()) continue
-      await persist(incoming)
-      byId.set(incoming.id, incoming)
-      changed = true
-    }
-    if (changed) set({ clips: orderClips([...byId.values()]) })
   },
   async purgeExpiredImages() {
     const clips = get().clips

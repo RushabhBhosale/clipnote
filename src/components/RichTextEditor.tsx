@@ -18,20 +18,21 @@ function escapeHtml(value: string) {
 
 function sanitizeRichHtml(html: string) {
   const documentFragment = new DOMParser().parseFromString(html, 'text/html')
-  const cleanNode = (node: Node): string => {
+  const cleanNode = (node: Node, parentTag?: string): string => {
     if (node.nodeType === Node.TEXT_NODE) return escapeHtml((node.textContent ?? '').replace(/\u200b/g, ''))
     if (node.nodeType !== Node.ELEMENT_NODE) return ''
 
     const element = node as HTMLElement
     const tag = element.tagName.toLowerCase()
-    const children = [...element.childNodes].map(cleanNode).join('')
-    if (!allowedTags.has(tag)) return children
+    if (!allowedTags.has(tag)) return [...element.childNodes].map((child) => cleanNode(child, parentTag)).join('')
     if (tag === 'br') return '<br>'
     const canonicalTag = tag === 'b' ? 'strong' : tag === 'i' ? 'em' : tag === 'strike' || tag === 'del' ? 's' : tag
+    const children = [...element.childNodes].map((child) => cleanNode(child, canonicalTag)).join('')
+    if (canonicalTag === parentTag && (canonicalTag === 'strong' || canonicalTag === 'em' || canonicalTag === 's')) return children
     return `<${canonicalTag}>${children}</${canonicalTag}>`
   }
 
-  return [...documentFragment.body.childNodes].map(cleanNode).join('')
+  return [...documentFragment.body.childNodes].map((child) => cleanNode(child)).join('')
 }
 
 function editorHtml(value: string) {
@@ -123,14 +124,65 @@ function unwrapSelectedFormat(range: Range, selection: Selection, wrapper: Eleme
   selection.addRange(nextRange)
 }
 
+function fragmentIsFormatted(fragment: DocumentFragment, tag: InlineFormat) {
+  const walker = document.createTreeWalker(fragment, NodeFilter.SHOW_TEXT)
+  let foundText = false
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (!node.textContent?.trim()) continue
+    foundText = true
+    let parent = node.parentElement
+    let formatted = false
+    while (parent) {
+      if (parent.tagName.toLowerCase() === tag) {
+        formatted = true
+        break
+      }
+      parent = parent.parentElement
+    }
+    if (!formatted) return false
+  }
+  return foundText
+}
+
+function unwrapFormatTags(fragment: DocumentFragment, tag: InlineFormat) {
+  const wrappers = [...fragment.querySelectorAll(tag)].reverse()
+  for (const wrapper of wrappers) wrapper.replaceWith(...wrapper.childNodes)
+}
+
+function insertAndSelectFragment(range: Range, selection: Selection, fragment: DocumentFragment) {
+  const insertedNodes = [...fragment.childNodes]
+  range.deleteContents()
+  range.insertNode(fragment)
+  if (!insertedNodes.length) return
+  const nextRange = document.createRange()
+  nextRange.setStartBefore(insertedNodes[0])
+  nextRange.setEndAfter(insertedNodes.at(-1)!)
+  selection.removeAllRanges()
+  selection.addRange(nextRange)
+}
+
 function toggleInlineFormat(editor: HTMLDivElement, tag: InlineFormat) {
   const activeRange = editorRange(editor)
   if (!activeRange) return
-  const { range, selection } = activeRange
-  const startFormat = closestFormatAncestor(range.startContainer, editor, tag)
-  const endFormat = closestFormatAncestor(range.endContainer, editor, tag)
-  if (startFormat && startFormat === endFormat) {
-    unwrapSelectedFormat(range, selection, startFormat)
+  const { selection } = activeRange
+  let removedFormat = false
+
+  for (let depth = 0; depth < 20 && selection.rangeCount; depth += 1) {
+    const selectedRange = selection.getRangeAt(0)
+    const startFormat = closestFormatAncestor(selectedRange.startContainer, editor, tag)
+    const endFormat = closestFormatAncestor(selectedRange.endContainer, editor, tag)
+    if (!startFormat || startFormat !== endFormat) break
+    unwrapSelectedFormat(selectedRange, selection, startFormat)
+    removedFormat = true
+  }
+  if (removedFormat) return
+
+  const range = selection.getRangeAt(0)
+  const selectedFragment = range.cloneContents()
+  if (!range.collapsed && fragmentIsFormatted(selectedFragment, tag)) {
+    const unformattedFragment = range.extractContents()
+    unwrapFormatTags(unformattedFragment, tag)
+    insertAndSelectFragment(range, selection, unformattedFragment)
     return
   }
 

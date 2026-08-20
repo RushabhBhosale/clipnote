@@ -1,11 +1,9 @@
 import * as Clipboard from 'expo-clipboard'
 import { StatusBar } from 'expo-status-bar'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Alert, AppState, Image, Pressable, SectionList, StyleSheet, Text, TextInput, View } from 'react-native'
+import { Alert, Pressable, SectionList, StyleSheet, Text, TextInput, View } from 'react-native'
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context'
-import type { User } from '@supabase/supabase-js'
 import { loadClips, saveClips } from './src/storage'
-import { isConfigured, listen, pull, push, sessionUser, signIn, signOut, signUp } from './src/sync'
 import type { Clip, ContentType } from './src/types'
 
 const ink = '#292a2d'
@@ -33,8 +31,6 @@ function titleFor(text: string) {
   return firstLine.slice(0, 90) || 'Untitled note'
 }
 
-const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-
 function newId() {
   const nativeUuid = globalThis.crypto?.randomUUID?.()
   if (nativeUuid) return nativeUuid
@@ -43,11 +39,6 @@ function newId() {
   bytes[8] = (bytes[8] & 0x3f) | 0x80
   const hex = bytes.map((byte) => byte.toString(16).padStart(2, '0'))
   return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex.slice(6, 8).join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10).join('')}`
-}
-
-function repairLocalIds(clips: Clip[]) {
-  const now = new Date().toISOString()
-  return clips.map((clip) => uuidPattern.test(clip.id) ? clip : { ...clip, id: newId(), updatedAt: now })
 }
 
 function makeClip(text: string, sourceApplication = 'Daily note'): Clip {
@@ -73,11 +64,6 @@ function findTodayNote(clips: Clip[]) {
     .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0]
 }
 
-function localDayKey(value: string) {
-  const date = new Date(value)
-  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`
-}
-
 function dayLabel(value: string) {
   const date = new Date(value)
   const today = new Date()
@@ -91,54 +77,14 @@ function timeLabel(value: string) {
   return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(value))
 }
 
-function AuthScreen({ onDone }: { onDone: () => void }) {
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [message, setMessage] = useState<string>()
-  const [busy, setBusy] = useState(false)
-  const submit = async (mode: 'sign-in' | 'sign-up') => {
-    if (!email.trim() || password.length < 6) return setMessage('Enter an email and a password of at least 6 characters.')
-    setBusy(true)
-    setMessage(undefined)
-    try {
-      if (mode === 'sign-in') await signIn(email.trim(), password)
-      else {
-        await signUp(email.trim(), password)
-        setMessage('Account created. Confirm your email if asked, then sign in here and on your laptop.')
-      }
-      onDone()
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Could not connect your account.')
-    } finally { setBusy(false) }
-  }
-  return <SafeAreaView style={styles.authPage} edges={['top', 'bottom', 'left', 'right']}>
-    <StatusBar style="dark" />
-    <View style={styles.authCard}>
-      <Image source={require('./assets/icon.png')} style={styles.mark} accessibilityLabel="ClipNote" />
-      <Text style={styles.authTitle}>ClipNote</Text>
-      <Text style={styles.authText}>Sign in with the same account you use on your laptop. Your notes will stay in sync automatically.</Text>
-      <TextInput style={styles.input} autoCapitalize="none" autoComplete="email" keyboardType="email-address" value={email} onChangeText={setEmail} placeholder="Email" placeholderTextColor="#9c9ca1" />
-      <TextInput style={styles.input} autoCapitalize="none" autoComplete="password" secureTextEntry value={password} onChangeText={setPassword} placeholder="Password" placeholderTextColor="#9c9ca1" />
-      {message ? <Text style={styles.formMessage}>{message}</Text> : null}
-      <Pressable disabled={busy} style={[styles.primaryButton, busy && styles.disabled]} onPress={() => void submit('sign-in')}><Text style={styles.primaryButtonText}>{busy ? 'Connecting…' : 'Sign in'}</Text></Pressable>
-      <Pressable disabled={busy} style={styles.secondaryButton} onPress={() => void submit('sign-up')}><Text style={styles.secondaryButtonText}>Create account</Text></Pressable>
-      <Text style={styles.privacyText}>Sensitive clipboard entries and temporary codes never sync to the cloud.</Text>
-    </View>
-  </SafeAreaView>
-}
-
 function ClipNoteApp() {
-  const [user, setUser] = useState<User>()
   const [clips, setClips] = useState<Clip[]>([])
   const [localReady, setLocalReady] = useState(false)
-  const [cloudReady, setCloudReady] = useState(false)
   const [draft, setDraft] = useState('')
   const [draftDirty, setDraftDirty] = useState(false)
-  const [syncNoteId, setSyncNoteId] = useState<string>()
+  const [draftNoteId, setDraftNoteId] = useState<string>()
   const clipsRef = useRef<Clip[]>([])
   const editVersion = useRef(0)
-  const consolidating = useRef(false)
-  const uploadedRevisions = useRef(new Map<string, string>())
   const todayNote = useMemo(() => findTodayNote(clips), [clips])
 
   const commit = useCallback((next: Clip[]) => {
@@ -148,139 +94,43 @@ function ClipNoteApp() {
     void saveClips(ordered)
   }, [])
 
-  const mergeRemote = useCallback((incoming: Clip[]) => {
-    const byId = new Map(clipsRef.current.map((clip) => [clip.id, clip]))
-    for (const remote of incoming) {
-      if (remote.isSensitive || remote.contentType === 'image' || remote.expiresAt) continue
-      const local = byId.get(remote.id)
-      if (!local || Date.parse(remote.updatedAt) > Date.parse(local.updatedAt)) byId.set(remote.id, remote)
-    }
-    commit([...byId.values()])
+  useEffect(() => {
+    void loadClips().then((saved) => { commit(saved); setLocalReady(true) })
   }, [commit])
-
-  useEffect(() => {
-    // Earlier Android builds could create non-UUID IDs, which Supabase rejected.
-    // Re-key those offline notes once so the first reconciliation uploads them.
-    void loadClips().then((saved) => { commit(repairLocalIds(saved)); setLocalReady(true) })
-    let stop = () => {}
-    void listen(mergeRemote, setUser).then((unsubscribe) => { stop = unsubscribe })
-    return () => stop()
-  }, [commit, mergeRemote])
-
-  useEffect(() => {
-    if (!localReady || !user) { setCloudReady(false); return }
-    let cancelled = false
-    let syncing = false
-    uploadedRevisions.current.clear()
-    setCloudReady(false)
-    const reconcile = async () => {
-      if (cancelled || syncing) return
-      syncing = true
-      try {
-        // Realtime is immediate when available; this keeps both timelines
-        // current after a backgrounded phone or a transient connection drop.
-        mergeRemote(await pull())
-        if (!cancelled) setCloudReady(true)
-      } catch {
-        if (!cancelled) setCloudReady(false)
-      } finally { syncing = false }
-    }
-    void reconcile()
-    const interval = setInterval(() => { void reconcile() }, 2_000)
-    const appState = AppState.addEventListener('change', (state) => { if (state === 'active') void reconcile() })
-    return () => { cancelled = true; clearInterval(interval); appState.remove() }
-  }, [localReady, mergeRemote, user])
-
-  useEffect(() => {
-    if (!cloudReady) return
-    const changed = clips.filter((clip) => !clip.isSensitive && !clip.expiresAt && uploadedRevisions.current.get(clip.id) !== clip.updatedAt)
-    if (!changed.length) return
-    const timeout = setTimeout(() => { void push(changed).then(() => changed.forEach((clip) => uploadedRevisions.current.set(clip.id, clip.updatedAt))).catch(() => setCloudReady(false)) }, 120)
-    return () => clearTimeout(timeout)
-  }, [clips, cloudReady])
-
-  useEffect(() => {
-    if (!localReady || consolidating.current) return
-    const groups = new Map<string, Clip[]>()
-    clips.filter((clip) => !clip.deletedAt && !clip.isSnippet && isWrittenNote(clip)).forEach((clip) => {
-      const key = localDayKey(clip.createdAt)
-      groups.set(key, [...(groups.get(key) ?? []), clip])
-    })
-    const replacements = new Map<string, Clip>()
-    const upload: Clip[] = []
-    const now = new Date().toISOString()
-    for (const entries of groups.values()) {
-      if (entries.length < 2) continue
-      const canonical = [...entries].sort((a, b) => {
-        const sourceRank = Number(b.sourceApplication === 'Daily note') - Number(a.sourceApplication === 'Daily note')
-        return sourceRank || Date.parse(b.updatedAt) - Date.parse(a.updatedAt)
-      })[0]
-      let rawContent = canonical.rawContent.trim()
-      for (const entry of [...entries].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))) {
-        const content = entry.rawContent.trim()
-        if (!content || entry.id === canonical.id || rawContent.includes(content)) continue
-        rawContent += `${rawContent ? '\n\n' : ''}${content}`
-      }
-      const merged: Clip = {
-        ...canonical,
-        rawContent,
-        normalizedContent: normalized(rawContent),
-        title: rawContent ? titleFor(rawContent) : 'Daily note',
-        contentType: 'text',
-        sourceApplication: 'Daily note',
-        updatedAt: now,
-        lastCopiedAt: now,
-      }
-      replacements.set(merged.id, merged)
-      upload.push(merged)
-      entries.forEach((entry) => {
-        if (entry.id !== merged.id) replacements.set(entry.id, { ...entry, deletedAt: now, updatedAt: now })
-      })
-    }
-    if (!replacements.size) return
-    consolidating.current = true
-    commit(clips.map((clip) => replacements.get(clip.id) ?? clip))
-    void push(upload)
-      .then(() => upload.forEach((clip) => uploadedRevisions.current.set(clip.id, clip.updatedAt)))
-      .catch(() => setCloudReady(false))
-      .finally(() => { consolidating.current = false })
-  }, [clips, commit, localReady])
 
   useEffect(() => {
     if (!localReady) return
     if (!todayNote) {
       if (!draftDirty) setDraft('')
-      setSyncNoteId(undefined)
+      setDraftNoteId(undefined)
       return
     }
-    const changedDocument = syncNoteId !== todayNote.id
-    setSyncNoteId(todayNote.id)
+    const changedDocument = draftNoteId !== todayNote.id
+    setDraftNoteId(todayNote.id)
     if (changedDocument || !draftDirty) setDraft(todayNote.rawContent)
-  }, [draftDirty, localReady, syncNoteId, todayNote?.id, todayNote?.rawContent, todayNote?.updatedAt])
+  }, [draftDirty, draftNoteId, localReady, todayNote?.id, todayNote?.rawContent, todayNote?.updatedAt])
 
   useEffect(() => {
-    if (!draftDirty || !localReady || (!draft.trim() && !syncNoteId)) return
+    if (!draftDirty || !localReady || (!draft.trim() && !draftNoteId)) return
     const version = editVersion.current
     const timeout = setTimeout(() => {
-      const current = (syncNoteId ? clipsRef.current.find((clip) => clip.id === syncNoteId && isWrittenNote(clip)) : undefined) ?? findTodayNote(clipsRef.current)
+      const current = (draftNoteId ? clipsRef.current.find((clip) => clip.id === draftNoteId && isWrittenNote(clip)) : undefined) ?? findTodayNote(clipsRef.current)
       const now = new Date().toISOString()
       const saved = current
         ? { ...current, rawContent: draft, normalizedContent: normalized(draft), title: draft.trim() ? titleFor(draft) : 'Today', sourceApplication: 'Daily note', updatedAt: now, lastCopiedAt: now }
         : makeClip(draft)
-      if (!current) setSyncNoteId(saved.id)
+      if (!current) setDraftNoteId(saved.id)
       commit([saved, ...clipsRef.current.filter((clip) => clip.id !== saved.id)])
       if (editVersion.current === version) setDraftDirty(false)
-      void push([saved]).then(() => uploadedRevisions.current.set(saved.id, saved.updatedAt)).catch(() => setCloudReady(false))
     }, 180)
     return () => clearTimeout(timeout)
-  }, [commit, draft, draftDirty, localReady, syncNoteId])
+  }, [commit, draft, draftDirty, draftNoteId, localReady])
 
   const captureClipboard = async () => {
     const text = await Clipboard.getStringAsync()
     if (!text.trim()) return Alert.alert('Nothing to save', 'Copy something first, then return here and tap Paste clipboard.')
     const saved = makeClip(text, 'Mobile clipboard')
     commit([saved, ...clipsRef.current.filter((clip) => clip.id !== saved.id)])
-    void push([saved]).then(() => uploadedRevisions.current.set(saved.id, saved.updatedAt)).catch(() => setCloudReady(false))
   }
 
   const copyClip = async (clip: Clip) => {
@@ -288,14 +138,12 @@ function ClipNoteApp() {
     const now = new Date().toISOString()
     const updated = { ...clip, lastCopiedAt: now, updatedAt: now, copyCount: clip.copyCount + 1 }
     commit([updated, ...clipsRef.current.filter((entry) => entry.id !== clip.id)])
-    void push([updated]).then(() => uploadedRevisions.current.set(updated.id, updated.updatedAt)).catch(() => setCloudReady(false))
   }
 
   const trashClip = (clip: Clip) => {
     const updated = { ...clip, deletedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
     commit([updated, ...clipsRef.current.filter((entry) => entry.id !== clip.id)])
-    if (clip.id === syncNoteId) { setDraft(''); setDraftDirty(false); setSyncNoteId(undefined) }
-    void push([updated]).then(() => uploadedRevisions.current.set(updated.id, updated.updatedAt)).catch(() => setCloudReady(false))
+    if (clip.id === draftNoteId) { setDraft(''); setDraftDirty(false); setDraftNoteId(undefined) }
   }
 
   const confirmTrash = (clip: Clip) => {
@@ -320,24 +168,22 @@ function ClipNoteApp() {
     setDraftDirty(true)
   }
 
-  if (!isConfigured()) return <SafeAreaView style={styles.authPage} edges={['top', 'bottom', 'left', 'right']}><Text style={styles.authTitle}>ClipNote needs sync configuration.</Text></SafeAreaView>
-  if (!user) return <AuthScreen onDone={() => void sessionUser().then(setUser)} />
+  if (!localReady) return <SafeAreaView style={styles.loadingPage} edges={['top', 'bottom', 'left', 'right']}><StatusBar style="dark" /><Text style={styles.loadingText}>Opening ClipNote…</Text></SafeAreaView>
 
   return <SafeAreaView style={styles.page} edges={['top', 'bottom', 'left', 'right']}>
     <StatusBar style="dark" />
     <View style={styles.topbar}>
-      <View><Text style={styles.title}>ClipNote</Text><Text style={styles.subtitle}>{cloudReady ? 'Synced with your laptop' : 'Saving locally…'}</Text></View>
-      <Pressable style={styles.signOut} onPress={() => void signOut()}><Text style={styles.signOutText}>Sign out</Text></Pressable>
+      <View><Text style={styles.title}>ClipNote</Text><Text style={styles.subtitle}>Saved only on this device</Text></View>
     </View>
     <View style={styles.composer}>
-      <View style={styles.composerHeading}><Text style={styles.composerDay}>Today</Text><Text style={styles.savedHint}>{cloudReady ? 'Saved automatically' : 'Saving locally'}</Text></View>
+      <View style={styles.composerHeading}><Text style={styles.composerDay}>Today</Text><Text style={styles.savedHint}>{draftDirty ? 'Saving locally…' : 'Saved locally'}</Text></View>
       <TextInput value={draft} onChangeText={changeDraft} placeholder="Start writing…" placeholderTextColor="#8b8b90" multiline style={styles.composerInput} textAlignVertical="top" />
     </View>
     <View style={styles.actions}><Pressable style={styles.clipboardButton} onPress={() => void captureClipboard()}><Text style={styles.clipboardButtonText}>Paste clipboard</Text></Pressable><Text style={styles.actionsHint}>Save copied text while ClipNote is open</Text></View>
     <SectionList sections={sections} keyExtractor={(item) => item.id} contentContainerStyle={sections.length ? styles.list : styles.emptyList}
       renderSectionHeader={({ section }) => <Text style={styles.dayTitle}>{section.title}</Text>}
       renderItem={({ item }) => <View style={styles.entry}><Text style={styles.entryTime}>{timeLabel(item.updatedAt)}</Text><Pressable style={styles.entryBody} onPress={() => void copyClip(item)}><Text style={styles.entryMeta}>{isWrittenNote(item) ? 'Daily note' : 'Copied'}</Text><Text numberOfLines={8} style={styles.entryContent}>{item.rawContent}</Text><Text style={styles.entryHint}>Tap to copy</Text></Pressable><Pressable hitSlop={10} onPress={() => confirmTrash(item)}><Text style={styles.delete}>Delete</Text></Pressable></View>}
-      ListEmptyComponent={<View style={styles.empty}><Text style={styles.emptyTitle}>Your shared notebook is empty.</Text><Text style={styles.emptyText}>Write here or paste your clipboard. It will appear on your laptop right away.</Text></View>}
+      ListEmptyComponent={<View style={styles.empty}><Text style={styles.emptyTitle}>Your local notebook is empty.</Text><Text style={styles.emptyText}>Write here or paste your clipboard. Everything stays on this device.</Text></View>}
     />
   </SafeAreaView>
 }
@@ -347,14 +193,9 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  page: { flex: 1, backgroundColor: '#f8f7f4' }, authPage: { flex: 1, justifyContent: 'center', backgroundColor: '#f8f7f4', padding: 24 },
-  authCard: { width: '100%', maxWidth: 420, alignSelf: 'center', borderWidth: 1, borderColor: border, borderRadius: 18, backgroundColor: paper, padding: 25 },
-  mark: { width: 42, height: 42, borderRadius: 12 },
-  authTitle: { color: ink, fontSize: 28, fontWeight: '700', letterSpacing: -0.7, marginTop: 17 }, authText: { color: muted, fontSize: 14, lineHeight: 20, marginTop: 8, marginBottom: 20 },
-  input: { borderWidth: 1, borderColor: border, borderRadius: 9, color: ink, fontSize: 15, paddingHorizontal: 12, paddingVertical: 11, marginBottom: 10, backgroundColor: '#fff' },
-  formMessage: { color: '#8f6727', fontSize: 12, lineHeight: 17, marginVertical: 6 }, primaryButton: { alignItems: 'center', borderRadius: 9, backgroundColor: accent, paddingVertical: 12, marginTop: 8 }, primaryButtonText: { color: '#fff', fontSize: 15, fontWeight: '700' },
-  secondaryButton: { alignItems: 'center', borderRadius: 9, borderWidth: 1, borderColor: border, paddingVertical: 11, marginTop: 9 }, secondaryButtonText: { color: ink, fontSize: 14, fontWeight: '600' }, disabled: { opacity: 0.6 }, privacyText: { color: muted, fontSize: 11, lineHeight: 16, marginTop: 19 },
-  topbar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 19, paddingTop: 15, paddingBottom: 13, backgroundColor: paper, borderBottomWidth: 1, borderBottomColor: border }, title: { color: ink, fontSize: 22, fontWeight: '700', letterSpacing: -0.5 }, subtitle: { color: muted, fontSize: 11, marginTop: 2 }, signOut: { paddingVertical: 7, paddingHorizontal: 9 }, signOutText: { color: muted, fontSize: 12, fontWeight: '600' },
+  page: { flex: 1, backgroundColor: '#f8f7f4' },
+  loadingPage: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#f8f7f4' }, loadingText: { color: muted, fontSize: 14 },
+  topbar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 19, paddingTop: 15, paddingBottom: 13, backgroundColor: paper, borderBottomWidth: 1, borderBottomColor: border }, title: { color: ink, fontSize: 22, fontWeight: '700', letterSpacing: -0.5 }, subtitle: { color: muted, fontSize: 11, marginTop: 2 },
   composer: { marginBottom: 9, borderTopWidth: 1, borderBottomWidth: 1, borderColor: border, backgroundColor: paper }, composerHeading: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingTop: 12, paddingHorizontal: 16 }, composerDay: { color: ink, fontSize: 12, fontWeight: '700' }, composerInput: { minHeight: 150, color: ink, fontSize: 16, lineHeight: 24, padding: 16, paddingTop: 12 }, savedHint: { color: muted, fontSize: 10 },
   actions: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 16, paddingBottom: 7 }, clipboardButton: { borderRadius: 8, borderWidth: 1, borderColor: '#ccd9ed', backgroundColor: '#f0f5fd', paddingVertical: 7, paddingHorizontal: 10 }, clipboardButtonText: { color: accent, fontWeight: '700', fontSize: 12 }, actionsHint: { color: muted, fontSize: 10, flexShrink: 1 },
   list: { paddingHorizontal: 16, paddingBottom: 42 }, dayTitle: { color: muted, fontSize: 11, fontWeight: '700', letterSpacing: 0.6, textTransform: 'uppercase', borderBottomWidth: 1, borderBottomColor: border, paddingTop: 23, paddingBottom: 8 }, entry: { flexDirection: 'row', gap: 10, paddingVertical: 15, borderBottomWidth: 1, borderBottomColor: border }, entryTime: { width: 56, color: muted, fontSize: 11, paddingTop: 2 }, entryBody: { flex: 1 }, entryMeta: { color: muted, fontSize: 10, fontWeight: '600' }, entryContent: { color: ink, fontSize: 15, lineHeight: 21, marginTop: 5 }, entryHint: { color: muted, fontSize: 10, marginTop: 5 }, delete: { color: '#b35d59', fontSize: 10, fontWeight: '600', paddingTop: 2 },

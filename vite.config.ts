@@ -9,8 +9,6 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
   },
-  // Supabase publishable keys are intentionally exposed to the client. The
-  // project secret key is never included in this allow-list.
-  envPrefix: ['VITE_', 'TAURI_', 'NEXT_PUBLIC_'],
+  envPrefix: ['VITE_', 'TAURI_'],
   build: { target: ['es2022', 'chrome105', 'safari13'] },
 })
