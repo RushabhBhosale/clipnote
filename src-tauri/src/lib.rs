@@ -441,6 +441,99 @@ fn show_clipnote(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn valid_external_target(target: &str) -> bool {
+    target.starts_with("https://") || target.starts_with("http://") || target.starts_with("mailto:")
+}
+
+#[tauri::command]
+fn open_external_target(target: String, private_mode: bool) -> Result<(), String> {
+    if target.len() > 8_192 || target.contains(['\n', '\r', '\0']) || !valid_external_target(&target) {
+        return Err("ClipNote refused an invalid external target".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if private_mode {
+            let private_result = Command::new("open")
+                .args(["-na", "Google Chrome", "--args", "--incognito"])
+                .arg(&target)
+                .status();
+            if private_result.is_ok_and(|status| status.success()) {
+                return Ok(());
+            }
+            return Err("Private browsing requires Google Chrome on this Mac".into());
+        }
+        Command::new("open").arg(&target).spawn().map_err(|_| "Unable to open this item".to_string())?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if private_mode { return Err("Private browsing is not available on this platform yet".into()); }
+        Command::new("rundll32").args(["url.dll,FileProtocolHandler", &target]).spawn().map_err(|_| "Unable to open this item".to_string())?;
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if private_mode { return Err("Private browsing is not available on this platform yet".into()); }
+        Command::new("xdg-open").arg(&target).spawn().map_err(|_| "Unable to open this item".to_string())?;
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn save_local_text_file(app: AppHandle, filename: String, content: String) -> Result<String, String> {
+    if filename.is_empty()
+        || filename.len() > 180
+        || !filename.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        || !["json", "txt", "sh"].iter().any(|extension| filename.ends_with(&format!(".{extension}")))
+        || content.len() > 5_000_000
+    {
+        return Err("ClipNote refused an invalid file export".into());
+    }
+    let downloads = app.path().download_dir().map_err(|_| "Unable to access the Downloads folder".to_string())?;
+    let path = downloads.join(filename);
+    fs::write(&path, content).map_err(|_| "Unable to save the file in Downloads".to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn potentially_destructive_command(command: &str) -> bool {
+    let normalized = command.to_ascii_lowercase();
+    ["rm ", "sudo ", "mkfs", "dd ", "shutdown", "reboot", "chmod -r", "chown -r"]
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
+        || ((normalized.contains("curl ") || normalized.contains("wget "))
+            && (normalized.contains("| sh") || normalized.contains("| bash")))
+}
+
+#[cfg(target_os = "macos")]
+fn apple_script_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "")
+}
+
+#[tauri::command]
+fn run_terminal_command(command: String, allow_destructive: bool) -> Result<(), String> {
+    if command.trim().is_empty() || command.len() > 20_000 || command.contains('\0') {
+        return Err("ClipNote refused an invalid terminal command".into());
+    }
+    if potentially_destructive_command(&command) && !allow_destructive {
+        return Err("This command requires the destructive-command confirmation".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
+            apple_script_string(command.trim())
+        );
+        let status = Command::new("osascript").args(["-e", &script]).status().map_err(|_| "Unable to open Terminal".to_string())?;
+        if !status.success() { return Err("Terminal declined the command".into()); }
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = allow_destructive;
+        Err("Run in Terminal is currently available in the macOS app".into())
+    }
+}
+
 fn show_main_window(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     let _ = app.show();
@@ -526,7 +619,10 @@ pub fn run() {
             set_sticky_mode,
             dismiss_after_copy,
             hide_clipnote,
-            show_clipnote
+            show_clipnote,
+            open_external_target,
+            save_local_text_file,
+            run_terminal_command
         ])
         .build(tauri::generate_context!())
         .expect("error while building ClipNote");

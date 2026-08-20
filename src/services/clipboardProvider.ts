@@ -7,7 +7,7 @@ export interface ClipboardImagePayload extends ClipboardImageInfo {
 }
 
 export interface ClipboardProvider {
-  start(onText: (text: string) => void, onImage?: (payload: ClipboardImagePayload) => Promise<void>): () => void
+  start(onText: (text: string) => void | Promise<void>, onImage?: (payload: ClipboardImagePayload) => Promise<void>): () => void
   write(text: string): Promise<void>
   writeImagePath(path: string): Promise<void>
 }
@@ -50,42 +50,51 @@ export const systemClipboardProvider: ClipboardProvider = {
     let previous = ''
     let previousImage = ''
     let active = true
+    let pollInFlight = false
     const poll = async () => {
-      if (!active) return
-      if (isTauri() && onImage) {
-        let clipboardImage: Image | undefined
+      // Reading the system clipboard and saving its value are both async. Do
+      // not start another read while either is still running, otherwise an
+      // older poll can overwrite the value remembered by a newer one.
+      if (!active || pollInFlight) return
+      pollInFlight = true
+      try {
+        if (isTauri() && onImage) {
+          let clipboardImage: Image | undefined
+          try {
+            clipboardImage = await readImage()
+            const info = await fingerprintClipboardImage(clipboardImage)
+            if (info.fingerprint === locallyWrittenImageFingerprint) {
+              previousImage = info.fingerprint
+              locallyWrittenImageFingerprint = undefined
+              return
+            }
+            if (info.fingerprint !== previousImage) {
+              previousImage = info.fingerprint
+              await onImage({ image: clipboardImage, ...info })
+            }
+            return
+          } catch {
+            // The current clipboard item is not an image; continue with text.
+          } finally {
+            await clipboardImage?.close().catch(() => undefined)
+          }
+        }
         try {
-          clipboardImage = await readImage()
-          const info = await fingerprintClipboardImage(clipboardImage)
-          if (info.fingerprint === locallyWrittenImageFingerprint) {
-            previousImage = info.fingerprint
-            locallyWrittenImageFingerprint = undefined
+          const current = await readClipboardText()
+          if (current && current === locallyWrittenText) {
+            previous = current
+            locallyWrittenText = undefined
             return
           }
-          if (info.fingerprint !== previousImage) {
-            previousImage = info.fingerprint
-            await onImage({ image: clipboardImage, ...info })
+          if (current && current !== previous) {
+            await onText(current)
+            previous = current
           }
-          return
         } catch {
-          // The current clipboard item is not an image; continue with text.
-        } finally {
-          await clipboardImage?.close().catch(() => undefined)
+          // Clipboard permission may be unavailable in a browser preview. Never surface clipboard data in errors.
         }
-      }
-      try {
-        const current = await readClipboardText()
-        if (current && current === locallyWrittenText) {
-          previous = current
-          locallyWrittenText = undefined
-          return
-        }
-        if (current && current !== previous) {
-          previous = current
-          onText(current)
-        }
-      } catch {
-        // Clipboard permission may be unavailable in a browser preview. Never surface clipboard data in errors.
+      } finally {
+        pollInFlight = false
       }
     }
     void poll()

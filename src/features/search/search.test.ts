@@ -14,4 +14,13 @@ describe('search', () => {
     expect(searchClips([clip], 'all', '^https', true).clips).toHaveLength(1)
     expect(validateRegex('[')).toBeTruthy()
   })
+
+  it('searches locally derived content types and URL domains without replacing text search', () => {
+    const jsonClip = { ...clip, id: 'json', title: 'Payload', rawContent: '{"active":true}', contentType: 'json' as const }
+    const errorClip = { ...clip, id: 'error', title: 'Build output', rawContent: 'npm ERR! command failed', contentType: 'text' as const }
+    expect(searchClips([jsonClip], 'all', 'json', false).clips).toHaveLength(1)
+    expect(searchClips([clip], 'all', 'tauri.app', false).clips).toHaveLength(1)
+    expect(searchClips([errorClip], 'all', 'error', false).clips).toHaveLength(1)
+    expect(searchClips([clip], 'all', 'Read Tauri', false).clips).toHaveLength(1)
+  })
 })

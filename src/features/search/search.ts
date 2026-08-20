@@ -1,4 +1,5 @@
 import type { Clip, ClipSection } from '../../types/clip'
+import { detectionSearchText } from '../smart-actions/actionEngine'
 
 export interface SearchResult {
   clips: Clip[]
@@ -34,11 +35,11 @@ export function searchClips(clips: Clip[], section: ClipSection, query: string, 
     const error = validateRegex(trimmed)
     if (error) return { clips: [], error }
     const regex = new RegExp(trimmed, 'i')
-    return { clips: scoped.filter((clip) => regex.test(`${clip.rawContent}\n${clip.ocrText ?? ''}`)) }
+    return { clips: scoped.filter((clip) => regex.test(`${clip.rawContent}\n${clip.ocrText ?? ''}\n${detectionSearchText(clip.rawContent)}`)) }
   }
   const needle = trimmed.toLocaleLowerCase()
   return {
-    clips: scoped.filter((clip) => [clip.title, clip.rawContent, clip.ocrText, clip.tags.join(' '), clip.sourceApplication]
+    clips: scoped.filter((clip) => [clip.title, clip.rawContent, clip.ocrText, clip.tags.join(' '), clip.sourceApplication, detectionSearchText(clip.rawContent)]
       .filter(Boolean)
       .join('\n')
       .toLocaleLowerCase()

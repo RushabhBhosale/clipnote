@@ -28,3 +28,29 @@ export async function showClipNote() {
   if (!isTauri()) return
   await invoke('show_clipnote')
 }
+
+export async function openExternalTarget(target: string, privateMode = false) {
+  if (!isTauri()) {
+    window.open(target, '_blank', 'noopener,noreferrer')
+    return
+  }
+  await invoke('open_external_target', { target, privateMode })
+}
+
+export async function saveLocalTextFile(filename: string, content: string) {
+  if (!isTauri()) {
+    const url = URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' }))
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = filename
+    anchor.click()
+    URL.revokeObjectURL(url)
+    return filename
+  }
+  return invoke<string>('save_local_text_file', { filename, content })
+}
+
+export async function runTerminalCommand(command: string, allowDestructive: boolean) {
+  if (!isTauri()) throw new Error('Terminal actions are available in the desktop app.')
+  await invoke('run_terminal_command', { command, allowDestructive })
+}

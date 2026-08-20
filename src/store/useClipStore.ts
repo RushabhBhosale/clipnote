@@ -1,6 +1,8 @@
 import { create } from 'zustand'
 import { classifyContent, suggestedTitle } from '../features/clipboard/classifier'
 import { moveToTrash as markTrashed, restoreFromTrash as untrash, updateRepeatedCopy } from '../features/clipboard/history'
+import { isClipboardImageExpired } from '../features/clipboard/imageRetention'
+import { richTextPlainText } from '../features/notes/richText'
 import { detectSensitiveContent, hasExpired } from '../features/sensitive-content/detector'
 import { makeId, toIsoDate } from '../lib/utils'
 import { systemClipboardProvider, type ClipboardImagePayload } from '../services/clipboardProvider'
@@ -11,6 +13,7 @@ import { loadSettings, saveSettings } from '../services/settingsRepository'
 import { defaultSettings, type Clip, type ClipSettings } from '../types/clip'
 
 let stopMonitoring: (() => void) | undefined
+let imagePurgeTimer: number | undefined
 
 interface ClipState {
   clips: Clip[]
@@ -24,6 +27,8 @@ interface ClipState {
   ingestText: (text: string, sourceApplication?: string) => Promise<void>
   ingestImage: (payload: ClipboardImagePayload, sourceApplication?: string) => Promise<void>
   addNote: (text: string) => Promise<string | undefined>
+  addActionResult: (text: string, title: string) => Promise<string | undefined>
+  copyText: (text: string) => Promise<boolean>
   createNote: (text: string, title?: string, color?: string) => Promise<string | undefined>
   saveStickyNote: (text: string, id?: string, title?: string) => Promise<string | undefined>
   consolidateDailyNotes: () => Promise<void>
@@ -39,6 +44,7 @@ interface ClipState {
   clearHistory: () => Promise<void>
   importClips: (entries: unknown[]) => Promise<void>
   mergeRemoteClips: (entries: Clip[]) => Promise<void>
+  purgeExpiredImages: () => Promise<void>
   updateSettings: (patch: Partial<ClipSettings>) => void
   clearToast: () => void
 }
@@ -106,6 +112,14 @@ async function trimHistory(clips: Clip[], settings: ClipSettings) {
   return overflow.map((clip) => clip.id)
 }
 
+async function removeExpiredImageClips(clips: Clip[]) {
+  const expired = clips.filter((clip) => isClipboardImageExpired(clip))
+  if (!expired.length) return clips
+  const results = await Promise.allSettled(expired.map((clip) => clipRepository.removePermanently(clip.id)))
+  const removedIds = new Set(expired.flatMap((clip, index) => results[index].status === 'fulfilled' ? [clip.id] : []))
+  return clips.filter((clip) => !removedIds.has(clip.id))
+}
+
 export const useClipStore = create<ClipState>((set, get) => ({
   clips: [],
   settings: defaultSettings,
@@ -118,8 +132,12 @@ export const useClipStore = create<ClipState>((set, get) => ({
       const fresh = clips.filter((clip) => !hasExpired(clip))
       const expired = clips.filter((clip) => hasExpired(clip))
       await Promise.all(expired.map((clip) => clipRepository.removePermanently(clip.id)))
-      set({ clips: orderClips(fresh), settings, isMonitoring: settings.startMonitoring, isReady: true })
+      const retained = await removeExpiredImageClips(fresh)
+      set({ clips: orderClips(retained), settings, isMonitoring: settings.startMonitoring, isReady: true })
       if (settings.startMonitoring) get().setMonitoring(true)
+      if (imagePurgeTimer === undefined) {
+        imagePurgeTimer = window.setInterval(() => { void get().purgeExpiredImages() }, 60_000)
+      }
     } catch {
       set({ error: 'ClipNote could not open local clipboard history.', settings, isReady: true })
     }
@@ -129,7 +147,7 @@ export const useClipStore = create<ClipState>((set, get) => ({
     stopMonitoring = undefined
     if (enabled) {
       stopMonitoring = systemClipboardProvider.start(
-        (text) => void get().ingestText(text),
+        (text) => get().ingestText(text),
         (payload) => get().ingestImage(payload),
       )
     }
@@ -190,10 +208,37 @@ export const useClipStore = create<ClipState>((set, get) => ({
   async addNote(text) {
     return get().saveStickyNote(text)
   },
-  async createNote(text, title, color) {
+  async addActionResult(text, title) {
     if (!text.trim()) return undefined
+    const result = createClip(text, get().settings, 'ClipNote Action')
+    result.title = title.trim() || result.title
+    await persist(result)
+    const next = [result, ...get().clips]
+    const overflowIds = await trimHistory(next, get().settings)
+    set({ clips: orderClips(next.map((entry) => overflowIds.includes(entry.id) ? { ...entry, deletedAt: toIsoDate() } : entry)) })
+    try {
+      await systemClipboardProvider.write(text)
+    } catch {
+      set({ toast: 'Result saved, but could not update the clipboard' })
+    }
+    return result.id
+  },
+  async copyText(text) {
+    try {
+      await systemClipboardProvider.write(text)
+      return true
+    } catch {
+      set({ toast: 'Could not write to the clipboard' })
+      return false
+    }
+  },
+  async createNote(text, title, color) {
+    const plainText = richTextPlainText(text)
+    if (!plainText.trim()) return undefined
     const note = createClip(text, get().settings, 'Daily note')
-    note.title = title && title.trim() ? title.trim() : note.title
+    note.title = title && title.trim() ? title.trim() : suggestedTitle(plainText, 'text')
+    note.contentType = 'text'
+    note.detectedLanguage = undefined
     if (color) note.color = color
     await persist(note)
     set({ clips: orderClips([note, ...get().clips]), toast: 'Note added' })
@@ -201,14 +246,17 @@ export const useClipStore = create<ClipState>((set, get) => ({
   },
   async saveStickyNote(text, id, title) {
     const current = id ? get().clips.find((clip) => clip.id === id && isWrittenNote(clip)) : undefined
-    if (!text.trim() && !current) return undefined
+    const plainText = richTextPlainText(text)
+    if (!plainText.trim() && !current) return undefined
     if (current) {
       const now = toIsoDate()
-      const updated = {
+      const updated: Clip = {
         ...current,
         rawContent: text,
-        normalizedContent: normalize(text),
-        title: title !== undefined ? title : (text.trim() ? suggestedTitle(text, 'text') : 'Today'),
+        normalizedContent: normalize(plainText),
+        title: title !== undefined ? title : (plainText.trim() ? suggestedTitle(plainText, 'text') : 'Today'),
+        contentType: 'text',
+        detectedLanguage: undefined,
         sourceApplication: 'Daily note',
         updatedAt: now,
         lastCopiedAt: now,
@@ -218,7 +266,9 @@ export const useClipStore = create<ClipState>((set, get) => ({
       return current.id
     }
     const note = createClip(text, get().settings, 'Daily note')
-    if (title !== undefined) note.title = title
+    note.title = title !== undefined ? title : (plainText.trim() ? suggestedTitle(plainText, 'text') : 'Today')
+    note.contentType = 'text'
+    note.detectedLanguage = undefined
     await persist(note)
     set({ clips: orderClips([note, ...get().clips]), toast: 'Note saved' })
     return note.id
@@ -267,6 +317,7 @@ export const useClipStore = create<ClipState>((set, get) => ({
     const current = get().clips.find((clip) => clip.id === id)
     if (!current) return
     const updated = { ...current, ...patch, updatedAt: toIsoDate() }
+    if (patch.rawContent !== undefined) updated.normalizedContent = normalize(isWrittenNote(updated) ? richTextPlainText(updated.rawContent) : updated.rawContent)
     if (updated.isFavorite) updated.expiresAt = undefined
     await persist(updated)
     set({ clips: orderClips(get().clips.map((clip) => clip.id === id ? updated : clip)) })
@@ -371,6 +422,11 @@ export const useClipStore = create<ClipState>((set, get) => ({
       changed = true
     }
     if (changed) set({ clips: orderClips([...byId.values()]) })
+  },
+  async purgeExpiredImages() {
+    const clips = get().clips
+    const retained = await removeExpiredImageClips(clips)
+    if (retained.length !== clips.length) set({ clips: orderClips(retained) })
   },
   updateSettings(patch) {
     const settings = { ...get().settings, ...patch }
